@@ -1,0 +1,367 @@
+name: Build Images & Generate Compose
+
+on:
+  workflow_dispatch: # 允许手动一键触发
+
+env:
+  REGISTRY: ghcr.io
+  PROXY_IMAGE: ${{ github.repository }}/claude-proxy
+  CLAUDE_IMAGE: ${{ github.repository }}/claude-code
+
+jobs:
+  build-and-pack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 1. 动态生成 Proxy Dockerfile（tproxy + dnsproxy，复用【宿主机】上的 SOCKS5）
+      #    与旧版相比：不再编译/下载 shadowsocks-rust 与 xray-plugin，
+      #    隧道由宿主机上现成的 SOCKS5 提供，proxy 容器只负责“透明代理 → 上游 SOCKS5”。
+      #    仍用 ARG TARGETARCH（buildx 注入）为 dnsproxy 选对应架构的预编译二进制。
+      - name: Generate Proxy Dockerfile
+        run: |
+          cat << 'EOF' > Dockerfile.proxy
+          FROM debian:trixie-slim AS builder
+          ARG TARGETARCH
+          RUN apt-get update && apt-get install -y git make gcc libc6-dev curl ca-certificates libyaml-dev
+
+          # hev-socks5-tproxy：从源码编译（make 在各目标架构下经 QEMU 模拟构建，产物即对应架构）
+          RUN git clone --depth 1 --recurse-submodules -b 2.11.0 https://github.com/heiher/hev-socks5-tproxy.git /src && cd /src && make
+
+          # dnsproxy：按架构下载预编译二进制
+          RUN if [ "${TARGETARCH}" = "amd64" ]; then DNS_ARCH="amd64"; \
+              elif [ "${TARGETARCH}" = "arm64" ]; then DNS_ARCH="arm64"; \
+              else echo "Unsupported arch: ${TARGETARCH}"; exit 1; fi && \
+              curl -L -o dns.tar.gz "https://github.com/AdguardTeam/dnsproxy/releases/download/v0.81.4/dnsproxy-linux-${DNS_ARCH}-v0.81.4.tar.gz" && \
+              tar xzvf dns.tar.gz && \
+              mv linux-${DNS_ARCH}/dnsproxy /usr/local/bin/
+
+          FROM debian:trixie-slim
+          #   procps 提供 sysctl；nftables/iproute2 做规则与策略路由；curl 供 healthcheck
+          RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 ca-certificates curl procps && rm -rf /var/lib/apt/lists/*
+
+          COPY --from=builder /src/bin/hev-socks5-tproxy /usr/local/bin/
+          COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
+
+          # ── 内置静态文件：nftables 规则（构建期写死）──────────────────────
+          #    要点：
+          #    - 不 flush ruleset，只声明/删除自有表，绝不触碰 Docker 自身的 NAT/masquerade
+          #    - 回环防护改为【按 SO_MARK】：hev 到上游 SOCKS5 的连接带 mark 0x438，
+          #      在 output 链 "meta mark 0x438 return" 放行。无论上游 SOCKS5 是私有还是
+          #      公网地址都不会被重新隧道化，也彻底摆脱了旧版“代理 UID 不能撞 1000”的限制。
+          #    - tproxy_nat：把容器内所有 :53 查询重定向到本地 dnsproxy（防 DNS 泄漏）
+          RUN cat <<'PROXY_NFT' > /etc/proxy.nft
+          table ip tproxy_mangle {
+              chain prerouting {
+                  type filter hook prerouting priority mangle; policy accept;
+                  # 被 output 打标并经 lo 重新注入的本机流量，投递给 hev 监听端口
+                  iif "lo" meta mark 1 meta l4proto { tcp, udp } tproxy to :1088 accept
+              }
+              chain output {
+                  type route hook output priority mangle; policy accept;
+                  # hev 到上游 SOCKS5 的连接(SO_MARK=0x438)直连放行，绝不回环
+                  meta mark 0x438 return
+                  # DNS 交给下面的 nat 链重定向到本地 dnsproxy
+                  meta l4proto { tcp, udp } th dport 53 return
+                  # 本地/私有目标直连（含宿主机网关、LAN 上的 SOCKS5）
+                  ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
+                  # 其余打标 → ip rule 送 table 100 → local default dev lo → 回到 prerouting
+                  meta l4proto { tcp, udp } mark set 1 accept
+              }
+          }
+
+          table ip tproxy_nat {
+              chain output {
+                  type nat hook output priority dstnat; policy accept;
+                  # hev 到上游 SOCKS5 的连接放行（万一上游端口恰为 53）
+                  meta mark 0x438 return
+                  # 已指向本地 dnsproxy 的直接放行
+                  ip daddr 127.0.0.1 return
+                  # 其它一切 :53 统一重定向到本机 dnsproxy(127.0.0.1:53)
+                  meta l4proto { tcp, udp } th dport 53 redirect to :53
+              }
+          }
+          PROXY_NFT
+
+          # ── entrypoint（构建期写死；tproxy.yaml 在运行期按环境变量生成）──────
+          RUN cat <<'ENTRY' > /entrypoint.sh
+          #!/bin/bash
+          set -e
+
+          # ===== 1. 确定上游 SOCKS5（宿主机上已有的代理）=====
+          # SOCKS5_SERVER 留空 → 自动探测“与本容器同链路的宿主机 IP”(默认网关)
+          if [ -z "${SOCKS5_SERVER}" ]; then
+              SOCKS5_SERVER="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
+              echo "[entrypoint] auto-detected host as ${SOCKS5_SERVER} (default gateway)"
+          fi
+          : "${SOCKS5_PORT:=1080}"
+          : "${SOCKS5_UDP:=udp}"
+
+          if [ -z "${SOCKS5_SERVER}" ]; then
+              echo "[entrypoint] FATAL: SOCKS5_SERVER 未设置且无法自动探测默认网关" >&2
+              exit 1
+          fi
+
+          # 若 SOCKS5_SERVER 是域名(如 host.docker.internal)：此刻 nft 规则尚未加载，
+          # root 流量可直连，先解析成 IP（getent 会优先命中 /etc/hosts）。
+          case "${SOCKS5_SERVER}" in
+              *[a-zA-Z]*)
+                  printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+                  _ip="$(getent ahostsv4 "${SOCKS5_SERVER}" 2>/dev/null | head -n1 | cut -d' ' -f1 || true)"
+                  if [ -n "${_ip}" ]; then
+                      echo "[entrypoint] resolved ${SOCKS5_SERVER} -> ${_ip}"
+                      SOCKS5_SERVER="${_ip}"
+                  else
+                      echo "[entrypoint] WARN: 无法解析 ${SOCKS5_SERVER}" >&2
+                  fi
+                  ;;
+          esac
+
+          echo "[entrypoint] upstream SOCKS5 = ${SOCKS5_SERVER}:${SOCKS5_PORT} (udp relay mode: ${SOCKS5_UDP})"
+
+          # ===== 2. 运行期生成 hev-socks5-tproxy 配置 =====
+          {
+              echo "main:"
+              echo "  workers: 1"
+              echo "socks5:"
+              echo "  port: ${SOCKS5_PORT}"
+              echo "  address: '${SOCKS5_SERVER}'"
+              echo "  udp: '${SOCKS5_UDP}'"
+              echo "  mark: 0x438"   # 出站打标，配合 nft 防回环
+              if [ -n "${SOCKS5_USERNAME}" ]; then
+                  echo "  username: '${SOCKS5_USERNAME}'"
+                  echo "  password: '${SOCKS5_PASSWORD}'"
+              fi
+              echo "tcp:"
+              echo "  port: 1088"
+              echo "  address: '0.0.0.0'"
+              echo "udp:"
+              echo "  port: 1088"
+              echo "  address: '0.0.0.0'"
+          } > /etc/tproxy.yaml
+
+          # ===== 3. resolv.conf 指向本地 dnsproxy =====
+          printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+
+          # ===== 4. 上游可达性自检（非致命，仅提示）=====
+          if (exec 3<>"/dev/tcp/${SOCKS5_SERVER}/${SOCKS5_PORT}") 2>/dev/null; then
+              exec 3>&-
+              echo "[entrypoint] upstream reachable OK"
+          else
+              echo "[entrypoint] WARN: 连不到 ${SOCKS5_SERVER}:${SOCKS5_PORT}" >&2
+              echo "[entrypoint]       请确认宿主机 SOCKS5 监听在容器可达地址(0.0.0.0 或 LAN IP / 已开启 Allow LAN)，而非仅 127.0.0.1" >&2
+          fi
+
+          # ===== 5. 内核参数 =====
+          sysctl -w net.ipv4.conf.all.route_localnet=1   2>/dev/null || true
+          sysctl -w net.ipv4.conf.all.rp_filter=0        2>/dev/null || true
+          sysctl -w net.ipv4.conf.lo.rp_filter=0         2>/dev/null || true
+          sysctl -w net.ipv6.conf.all.disable_ipv6=1     2>/dev/null || true
+          sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+
+          # ===== 6. 加载 tproxy 规则（只删自有表，不动 Docker 规则）=====
+          nft 'delete table ip tproxy_mangle' 2>/dev/null || true
+          nft 'delete table ip tproxy_nat'    2>/dev/null || true
+          nft -f /etc/proxy.nft
+          ip rule add fwmark 1 table 100 2>/dev/null || true
+          ip route add local default dev lo table 100 2>/dev/null || true
+
+          # ===== 7. 启动 hev-socks5-tproxy =====
+          # 以 root 运行：透明监听(TPROXY)需要 CAP_NET_ADMIN(容器已 cap_add NET_ADMIN)。
+          # 它到上游 SOCKS5 的连接带 SO_MARK=0x438，被 nft 放行，永不回环。
+          hev-socks5-tproxy /etc/tproxy.yaml &
+          sleep 1
+
+          # ===== 8. dnsproxy（root；:53 -> 上游 DoH:443，会被 tproxy 隧道化，防 DNS 泄漏）=====
+          exec dnsproxy -l 0.0.0.0 -p 53 -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query
+          ENTRY
+
+          RUN chmod +x /entrypoint.sh
+          ENTRYPOINT ["/entrypoint.sh"]
+          EOF
+
+      # 2. 构建并推送代理镜像到 GHCR（amd64 + arm64 多架构 manifest）
+      - name: Build and push proxy image (multi-arch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.proxy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.PROXY_IMAGE }}:latest
+
+      # 3. 动态生成 Claude Code 侧的 Dockerfile
+      - name: Generate Claude Dockerfile
+        run: |
+          cat << 'EOF' > Dockerfile.claude
+          FROM node:24-slim
+
+          # ── Claude Code 所需工具（root 安装，所有用户可见）──────────────────────────
+          #   git            — 版本控制（Claude Code 严重依赖 git）
+          #   openssh-client — git over SSH、私有仓库推拉
+          #   ca-certificates — HTTPS 根证书
+          #   curl           — 脚本下载 / 安装器
+          #   ripgrep (rg)   — 极速代码搜索，Claude Code 首选 grep 替代
+          #   fd-find (fd)   — 极速文件查找，Claude Code 首选 find 替代
+          #   jq             — JSON 处理
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                git \
+                curl \
+                ca-certificates \
+                openssh-client \
+                ripgrep \
+                fd-find \
+                jq \
+              && rm -rf /var/lib/apt/lists/* \
+              && ln -s "$(which fdfind)" /usr/local/bin/fd
+
+          # ── 以 node 用户身份安装 Claude Code ─────────────────────────────────────
+          # 注意：透明代理现在按 SO_MARK(0x438) 放行 hev 自身的上游连接，
+          # 不再依赖任何 UID 区分，故 node(UID 1000) 的全部出站都会被 tproxy 正确隧道化。
+          USER node
+
+          RUN curl -fsSL https://claude.ai/install.sh | bash
+
+          # ENTRYPOINT 不经过 login shell，不会 source .bashrc，
+          # 须通过 ENV 显式把 ~/.local/bin 加入 PATH
+          ENV PATH="/home/node/.local/bin:$PATH"
+
+          WORKDIR /workspace
+
+          ENTRYPOINT ["claude"]
+          EOF
+
+      # 4. 构建并推送 Claude Code 镜像到 GHCR（amd64 + arm64 多架构 manifest）
+      - name: Build and push claude-code image (multi-arch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.claude
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.CLAUDE_IMAGE }}:latest
+
+      # 5. 生成最终 docker-compose.yml：仅注入镜像名，隧道改为指向【宿主机】SOCKS5
+      - name: Generate Final Compose Artifact
+        env:
+          PROXY_IMAGE: ${{ env.REGISTRY }}/${{ env.PROXY_IMAGE }}
+          CLAUDE_IMAGE: ${{ env.REGISTRY }}/${{ env.CLAUDE_IMAGE }}
+        run: |
+          cat << 'EOF' > docker-compose.yml
+          # 使用前：proxy 容器会把所有出站透明代理到【宿主机上现成的 SOCKS5】。
+          #
+          #   docker compose up -d          # 后台启动（拉取 GHCR 镜像，无需本地构建）
+          #   docker attach claude-code     # 直连 PTY，TUI 正常渲染
+          #   退出 Claude Code 会话但保持容器运行：Ctrl+P Ctrl+Q
+          #   彻底停止：docker compose down
+          #
+          # ★ 重要前提：宿主机的 SOCKS5 必须监听在“容器可达”的地址，不能只听 127.0.0.1。
+          #   - 多数客户端(clash / v2rayN / sing-box 等)需开启 “Allow LAN / 允许局域网连接”，
+          #     或把监听地址设为 0.0.0.0 / 宿主机 LAN IP。
+          #
+          # ★ SOCKS5_SERVER 怎么填：
+          #   - 留空(默认)：容器自动探测“与自己同链路的宿主机 IP”(默认网关)，最省事。
+          #   - 也可手动填：宿主机 LAN IP(如 192.168.1.10)、网关 IP、或 host.docker.internal。
+          #   - 例：宿主机在 :1080 监听且开了 Allow LAN，留空即可；
+          #         或显式 SOCKS5_SERVER=192.168.1.10 / SOCKS5_PORT=1080。
+
+          name: claude-code
+
+          services:
+            proxy:
+              image: @@PROXY_IMAGE@@:latest
+              container_name: claude-proxy
+              cap_add:
+                - NET_ADMIN
+                - NET_RAW
+              dns:
+                - 127.0.0.1
+              # 让 host.docker.internal 指向宿主机（可选；留空 SOCKS5_SERVER 时用不到）
+              extra_hosts:
+                - "host.docker.internal:host-gateway"
+              environment:
+                # ── 上游 SOCKS5（宿主机上已有的代理；不再需要任何隧道明文密钥）──
+                # 留空 = 自动探测与本容器同链路的宿主机 IP(默认网关)
+                - SOCKS5_SERVER=
+                - SOCKS5_PORT=1080
+                # 可选认证（无认证则留空）
+                - SOCKS5_USERNAME=
+                - SOCKS5_PASSWORD=
+                # UDP 转发模式 udp|tcp；上游不支持 UDP 也不影响 Claude(纯 TCP/HTTPS)
+                - SOCKS5_UDP=tcp
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "curl", "-fsS", "-I", "https://www.google.com"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 20s
+              # ── 开发服务器端口，按需取消注释 ──
+              # ports:
+              #   - "3000:3000"     # Express / Next.js
+              #   - "5173:5173"     # Vite
+              #   - "8000:8000"     # Django / FastAPI
+              #   - "8080:8080"     # 通用 HTTP
+
+            claude:
+              image: @@CLAUDE_IMAGE@@:latest
+              container_name: claude-code
+              network_mode: "service:proxy"
+              depends_on:
+                proxy:
+                  condition: service_healthy
+                  restart: false
+              stdin_open: true
+              tty: true
+
+              volumes:
+                - .:/workspace
+                - ${HOME}/.gitconfig:/home/node/.gitconfig:ro
+                - ${HOME}/.ssh:/home/node/.ssh:ro
+                # 持久化 OAuth token 和用户设置，容器重建后无需重新登录
+                - claude_config:/home/node/.claude
+
+              working_dir: /workspace
+
+          volumes:
+            claude_config:
+          EOF
+
+          # 仅替换镜像名占位符（GHCR 要求镜像名全小写）
+          python3 -c '
+          import os
+          with open("docker-compose.yml", "r") as f:
+              content = f.read()
+          content = content.replace("@@PROXY_IMAGE@@", os.environ.get("PROXY_IMAGE", "").lower())
+          content = content.replace("@@CLAUDE_IMAGE@@", os.environ.get("CLAUDE_IMAGE", "").lower())
+          with open("docker-compose.yml", "w") as f:
+              f.write(content)
+          '
+
+      # 6. 发布到 GitHub Release，方便直接下载
+      - name: Publish docker-compose.yml to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          body: "Ready-to-use docker-compose.yml with pre-built GHCR images (upstream SOCKS5 on host)."
+          make_latest: true
+          files: docker-compose.yml
