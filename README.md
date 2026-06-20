@@ -27,7 +27,7 @@ Action 会构建 `claude-proxy` 和 `claude-code` 多架构镜像（amd64 + arm6
 确保宿主机上有一个 SOCKS5 代理在运行，且**监听在容器可达的地址**——不能只听 `127.0.0.1`。常见做法：
 
 - 把监听地址设为 `0.0.0.0`，或宿主机 LAN IP；
-- 客户端里开启 **Allow LAN / 允许局域网连接**（clash、sing-box、v2rayN 等都有此开关）。
+- 客户端里开启 **Allow LAN / 允许局域网连接**。
 
 > 注：proxy 容器在自己的 network namespace 里，宿主机的 `127.0.0.1` 对它不可达。容器通过宿主机在 Docker 网桥/局域网上的地址去连这个 SOCKS5。
 
