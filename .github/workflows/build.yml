@@ -209,19 +209,17 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.PROXY_IMAGE }}:latest
 
       # 3. 动态生成 Claude Code 侧的 Dockerfile
-      #    本版重点修复“每次重启都要重新登录”：
-      #    根因① 命名卷默认 root 属主 → node(uid 1000) 写不进 .credentials.json/.claude.json
-      #    根因② 登录态还依赖卷外的 ~/.claude.json，随容器重建丢失
-      #    对策：root entrypoint 运行期修属主(连旧的 root 属主卷也救) + 把 ~/.claude.json
-      #          落进卷并每次重建软链 + CLAUDE_CONFIG_DIR 收口全局配置，最后降权到 node。
+      #    简化方案：不再用 root entrypoint 运行期修属主/修复损坏的配置文件，
+      #    而是让命名卷挂载点在镜像内【预先归属 node】，命名卷首次创建时会
+      #    直接继承该属主，全程以 USER node 启动 claude 本体，无权限问题。
+      #    同时不再保留安装期生成的配置/机器标识文件，保证每次基于全新卷启动时
+      #    claude 都会重新生成配置（含新的 userId / machineId），不再考虑修复旧配置。
       - name: Generate Claude Dockerfile
         run: |
           cat << 'EOF' > Dockerfile.claude
           FROM node:24-slim
 
           # ── Claude Code 所需工具（root 安装，所有用户可见）──────────────────────────
-          #   git / openssh-client / ca-certificates / curl / ripgrep / fd-find / jq
-          #   util-linux：提供 setpriv（entrypoint 以 root 修属主后降权到 node 用）
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 git \
                 curl \
@@ -230,64 +228,33 @@ jobs:
                 ripgrep \
                 fd-find \
                 jq \
-                util-linux \
               && rm -rf /var/lib/apt/lists/* \
               && ln -s "$(which fdfind)" /usr/local/bin/fd
 
-          # 预创建配置目录并归属 node：命名卷【首次】挂载时会继承此属主（新卷即正确）
-          RUN mkdir -p /home/node/.claude && chown -R node:node /home/node/.claude
-
-          # ── 以 node 用户身份安装 Claude Code ─────────────────────────────────────
-          # binary 落在 /home/node/.local/bin/claude（原生安装预期路径）
-          USER node
-          RUN curl -fsSL https://claude.ai/install.sh | bash
-
-          # 切回 root：entrypoint 需要 root 权限在运行期修正卷属主，再降权运行 claude
-          USER root
+          # 预创建配置目录 / /opt 工具链目录并归属 node：
+          # 命名卷【首次】挂载时会直接继承挂载点的属主，无需运行期再修正。
+          # 本镜像基于 node:24-slim，/opt 内无系统预装内容，整体交给 node 持有可安全写入。
+          RUN mkdir -p /home/node/.claude && chown -R node:node /home/node/.claude \
+              && mkdir -p /opt && chown -R node:node /opt
 
           # CLAUDE_CONFIG_DIR 指向被持久化的 .claude 目录：
           # 让 CLI 的全局配置(等价 ~/.claude.json)也写进卷内（官方 devcontainer 推荐做法）
           ENV CLAUDE_CONFIG_DIR=/home/node/.claude
           ENV PATH="/home/node/.local/bin:$PATH"
 
-          # ── entrypoint：修属主 + 持久化 ~/.claude.json + 降权运行 ──────────────
-          RUN cat <<'CENTRY' > /usr/local/bin/claude-entry.sh
-          #!/bin/bash
-          set -e
-          CDIR=/home/node/.claude
-          REAL="${CDIR}/.claude-home.json"   # ~/.claude.json 的持久化实体(在卷内)
+          # ── 全程以 node 用户身份安装并运行 Claude Code ───────────────────────────
+          # binary 落在 /home/node/.local/bin/claude（原生安装预期路径）
+          USER node
+          RUN curl -fsSL https://claude.ai/install.sh | bash
 
-          mkdir -p "${CDIR}"
-
-          # 若上次运行中 CLI 把 ~/.claude.json 重建成了普通文件(破坏软链)，
-          # 先把它的内容回灌进卷，再于下方重建软链 —— 免疫这种偶发改写。
-          if [ -f /home/node/.claude.json ] && [ ! -L /home/node/.claude.json ]; then
-              cp -a /home/node/.claude.json "${REAL}" 2>/dev/null || true
-              rm -f /home/node/.claude.json || true
-          fi
-
-          # 卷内尚无实体时种一份最小配置，跳过首启 onboarding（不会覆盖已有的真实配置）
-          [ -e "${REAL}" ] || printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "${REAL}"
-
-          # (重)建软链 ~/.claude.json -> 卷内实体；每次启动都重建，确保始终指向持久化文件
-          ln -sfn "${REAL}" /home/node/.claude.json 2>/dev/null || true
-
-          # ★ 核心修复：命名卷默认以 root 属主创建，node 写不进凭据/配置 —— 正是“重启即重登”
-          #   的根因。每次启动统一把属主修正到 node，连历史上以 root 属主创建的旧卷也一并救回。
-          chown -R node:node "${CDIR}" 2>/dev/null || true
-          chown -h node:node /home/node/.claude.json 2>/dev/null || true
-
-          # 降权到 node 运行 claude（exec 替换进程，保留 PTY/信号，docker attach 正常）
-          exec setpriv --reuid 1000 --regid 1000 --init-groups \
-               env HOME=/home/node CLAUDE_CONFIG_DIR="${CDIR}" \
-               claude "$@"
-          CENTRY
-
-          RUN chmod +x /usr/local/bin/claude-entry.sh
+          # 删除安装过程中生成的配置文件/机器标识（如有），确保运行时挂载全新命名卷后
+          # claude 会重新生成全部配置（含新的 userId / machineId），不复用构建期状态。
+          # 注：~/.claude.json 位于 $HOME 根目录，并非 .claude/ 目录内的文件，二者需分别清理
+          RUN rm -rf /home/node/.claude/* /home/node/.claude.json
 
           WORKDIR /workspace
 
-          ENTRYPOINT ["/usr/local/bin/claude-entry.sh"]
+          ENTRYPOINT ["claude"]
           EOF
 
       # 4. 构建并推送 Claude Code 镜像到 GHCR（amd64 + arm64 多架构 manifest）
@@ -325,7 +292,12 @@ jobs:
           #         或显式 SOCKS5_SERVER=192.168.1.10 / SOCKS5_PORT=1080。
           #
           # ★ 登录态持久化：claude 容器会自动把 OAuth 凭据/会话/全局配置全部写入具名卷
-          #   claude_config（并在启动时修正卷属主），compose down/up(不带 -v) 不会再要你重登。
+          #   claude_config，compose down/up(不带 -v) 不会再要你重登；镜像内挂载点已
+          #   预先归属 node，全程以 USER node 启动 claude，无需运行期修属主。
+          #   若 down -v 删除了该卷，下次启动会用全新的 userId/machineId 重新生成配置。
+          #
+          # ★ opt_data：默认挂载到 /opt，用于保存环境专用工具链（如手动安装的 SDK / 运行时），
+          #   避免随容器重建丢失。
 
           name: claude-code
 
@@ -382,11 +354,14 @@ jobs:
                 - ${HOME}/.ssh:/home/node/.ssh:ro
                 # 持久化 OAuth token / 会话 / 全局配置，容器重建后无需重新登录
                 - claude_config:/home/node/.claude
+                # 持久化 /opt，用于保存环境专用工具链，避免随容器重建丢失
+                - opt_data:/opt
 
               working_dir: /workspace
 
           volumes:
             claude_config:
+            opt_data:
           EOF
 
           # 仅替换镜像名占位符（GHCR 要求镜像名全小写）
