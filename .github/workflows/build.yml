@@ -214,6 +214,10 @@ jobs:
       #    直接继承该属主，全程以 USER node 启动 claude 本体，无权限问题。
       #    同时不再保留安装期生成的配置/机器标识文件，保证每次基于全新卷启动时
       #    claude 都会重新生成配置（含新的 userId / machineId），不再考虑修复旧配置。
+      #    已实测验证：新版 claude code 在设置 CLAUDE_CONFIG_DIR 后，会把
+      #    .claude.json、OAuth 凭据、sessions/projects/telemetry 等全部配置文件
+      #    统一收纳进该目录，不再散落到 $HOME 根目录，因此单一命名卷
+      #    claude_config:/home/node/.claude 即可覆盖容器重建后需要保留的全部状态。
       - name: Generate Claude Dockerfile
         run: |
           cat << 'EOF' > Dockerfile.claude
@@ -249,8 +253,10 @@ jobs:
 
           # 删除安装过程中生成的配置文件/机器标识（如有），确保运行时挂载全新命名卷后
           # claude 会重新生成全部配置（含新的 userId / machineId），不复用构建期状态。
-          # 注：~/.claude.json 位于 $HOME 根目录，并非 .claude/ 目录内的文件，二者需分别清理
-          RUN rm -rf /home/node/.claude/* /home/node/.claude.json
+          # 已实测验证（claude-code 2.1.x）：CLAUDE_CONFIG_DIR 一旦设置，.claude.json 以及
+          # OAuth 凭据(.credentials.json)、backups/、sessions/、projects/、telemetry/ 等
+          # 全部落在该目录内，不再写到 $HOME 根目录，因此清空 .claude/ 即可覆盖全部状态。
+          RUN rm -rf /home/node/.claude/*
 
           WORKDIR /workspace
 
