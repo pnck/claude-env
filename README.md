@@ -82,6 +82,18 @@ environment:
 
 `proxy` 容器额外在 DNS 层拦截已知的遥测/统计域名（如 `statsig.anthropic.com`，解析到 `0.0.0.0` 使连接失败），即便应用侧开关被绕过或后续版本新增遥测调用也能兜底。如需拦截更多域名，在 `proxy` 服务的 `EXTRA_BLOCKED_HOSTS` 环境变量中追加（逗号分隔）；如需临时放开遥测，清空对应环境变量即可。
 
+如需单独放开内置屏蔽中的某一类域名（例如需要联调遥测，或自行接入 Sentry 上报），在 `proxy` 服务的 `environment` 中设置：
+
+```yaml
+environment:
+  # 放开 Anthropic/Statsig 遥测域名屏蔽（statsig.anthropic.com 等），默认 0=仍屏蔽
+  - ALLOW_ANTHROPIC_TELEMETRY=0
+  # 放开 Sentry 域名屏蔽（sentry.io / o1.ingest.sentry.io），默认 0=仍屏蔽
+  - ALLOW_SENTRY=0
+```
+
+设为 `1` 即放开对应一类域名的屏蔽；两者相互独立，可分别开启。
+
 ## 技术栈
 
 | 组件 | 版本 |

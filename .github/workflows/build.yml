@@ -66,15 +66,21 @@ jobs:
           #   把已知的 Claude Code / Statsig 遥测域名解析到 0.0.0.0，使其连接失败，从
           #   DNS 层面兜底拦截（即便应用侧遥测开关被绕过或后续版本新增遥测调用也能生效）。
           #   参考：2026 年社区对 Claude Code 遥测依赖 Statsig(现为 OpenAI 旗下产品)的隐私讨论。
+          #   ANTHROPIC_TELEMETRY_BEGIN/END 与 SENTRY_BEGIN/END 标记供 entrypoint 按需删除
+          #   对应分组（ALLOW_ANTHROPIC_TELEMETRY / ALLOW_SENTRY），修改分组内容时请保留标记行。
           RUN cat <<'BLOCKHOSTS' > /etc/telemetry-block.hosts
           # Claude Code / Anthropic 遥测与统计相关域名（解析到 0.0.0.0 即拦截）
+          # ANTHROPIC_TELEMETRY_BEGIN
           0.0.0.0 statsig.anthropic.com
           0.0.0.0 api.statsig.com
           0.0.0.0 statsig.com
           0.0.0.0 events.statsigapi.net
           0.0.0.0 featuregates.org
+          # ANTHROPIC_TELEMETRY_END
+          # SENTRY_BEGIN
           0.0.0.0 sentry.io
           0.0.0.0 o1.ingest.sentry.io
+          # SENTRY_END
           BLOCKHOSTS
 
           # ── 内置静态文件：nftables 规则（构建期写死）──────────────────────
@@ -211,7 +217,9 @@ jobs:
           if [ -n "${EXTRA_BLOCKED_HOSTS}" ]; then
               cp /etc/telemetry-block.hosts /tmp/telemetry-block.hosts
               _old_ifs="${IFS}"
-              set -f   # 禁用通配符展开，防止条目里的 */?/[ 触发意外的路径名展开
+              # 禁用 shell 通配符展开：防止 EXTRA_BLOCKED_HOSTS 域名条目里
+              # 若含 */?/[ 触发意外的路径名展开
+              set -f
               IFS=','
               for _h in ${EXTRA_BLOCKED_HOSTS}; do
                   # 仅接受合法域名：字母/数字/连字符/点，且不含首尾点/连字符、连续点、
@@ -242,6 +250,22 @@ jobs:
               IFS="${_old_ifs}"
               TELEMETRY_HOSTS_FILE=/tmp/telemetry-block.hosts
               echo "[entrypoint] extra blocked hosts: ${EXTRA_BLOCKED_HOSTS}"
+          fi
+
+          # ===== 8.5 隐私加固：按需放开内置屏蔽（ALLOW_ANTHROPIC_TELEMETRY / ALLOW_SENTRY，可选）=====
+          #    默认内置黑名单会屏蔽 Anthropic/Statsig 遥测域名与 Sentry 域名；
+          #    如需临时放开其中一类（如自建 Sentry 上报或需要遥测联调），设为 1 即可。
+          if [ "${ALLOW_ANTHROPIC_TELEMETRY}" = "1" ] || [ "${ALLOW_SENTRY}" = "1" ]; then
+              cp "${TELEMETRY_HOSTS_FILE}" /tmp/telemetry-block.hosts.filtered
+              if [ "${ALLOW_ANTHROPIC_TELEMETRY}" = "1" ]; then
+                  sed -i '/^# ANTHROPIC_TELEMETRY_BEGIN$/,/^# ANTHROPIC_TELEMETRY_END$/d' /tmp/telemetry-block.hosts.filtered
+                  echo "[entrypoint] ALLOW_ANTHROPIC_TELEMETRY=1: 已放开 Anthropic/Statsig 遥测域名屏蔽"
+              fi
+              if [ "${ALLOW_SENTRY}" = "1" ]; then
+                  sed -i '/^# SENTRY_BEGIN$/,/^# SENTRY_END$/d' /tmp/telemetry-block.hosts.filtered
+                  echo "[entrypoint] ALLOW_SENTRY=1: 已放开 Sentry 域名屏蔽"
+              fi
+              TELEMETRY_HOSTS_FILE=/tmp/telemetry-block.hosts.filtered
           fi
 
           # ===== 9. dnsproxy（root；:53 -> 上游 DoH:443，会被 tproxy 隧道化，防 DNS 泄漏）=====
@@ -381,6 +405,8 @@ jobs:
           #   proxy 容器额外在 DNS 层拦截 statsig.anthropic.com 等已知遥测域名（解析到
           #   0.0.0.0），双重防护。如需临时放开，删掉/清空对应环境变量即可。
           #   如需拦截更多域名，在 proxy 的 EXTRA_BLOCKED_HOSTS 里追加，用逗号分隔。
+          #   如需单独放开内置屏蔽的 Anthropic/Statsig 遥测或 Sentry 域名，把 proxy 的
+          #   ALLOW_ANTHROPIC_TELEMETRY / ALLOW_SENTRY 设为 1（默认 0，即仍屏蔽）。
 
           name: claude-code
 
@@ -408,6 +434,9 @@ jobs:
                 - SOCKS5_UDP=tcp
                 # 额外自定义要拦截的遥测/统计域名，逗号分隔，追加到内置黑名单之后
                 - EXTRA_BLOCKED_HOSTS=
+                # 临时放开内置屏蔽（默认 0=仍屏蔽；设为 1 放开对应一类域名）
+                - ALLOW_ANTHROPIC_TELEMETRY=0
+                - ALLOW_SENTRY=0
               restart: unless-stopped
               healthcheck:
                 test: ["CMD", "curl", "-fsS", "-I", "https://www.google.com"]
