@@ -61,6 +61,22 @@ jobs:
           COPY --from=builder /src/bin/hev-socks5-tproxy /usr/local/bin/
           COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
 
+          # ── 隐私加固：内置遥测域名黑名单（构建期写死，运行期可用 EXTRA_BLOCKED_HOSTS 追加）──
+          #   dnsproxy 原生支持 --hosts-file-enabled + --hosts-files 做 hosts 风格覆盖解析；
+          #   把已知的 Claude Code / Statsig 遥测域名解析到 0.0.0.0，使其连接失败，从
+          #   DNS 层面兜底拦截（即便应用侧遥测开关被绕过或后续版本新增遥测调用也能生效）。
+          #   参考：2026 年社区对 Claude Code 遥测依赖 Statsig(现为 OpenAI 旗下产品)的隐私讨论。
+          RUN cat <<'BLOCKHOSTS' > /etc/telemetry-block.hosts
+          # Claude Code / Anthropic 遥测与统计相关域名（解析到 0.0.0.0 即拦截）
+          0.0.0.0 statsig.anthropic.com
+          0.0.0.0 api.statsig.com
+          0.0.0.0 statsig.com
+          0.0.0.0 events.statsigapi.net
+          0.0.0.0 featuregates.org
+          0.0.0.0 sentry.io
+          0.0.0.0 o1.ingest.sentry.io
+          BLOCKHOSTS
+
           # ── 内置静态文件：nftables 规则（构建期写死）──────────────────────
           #    要点：
           #    - 不 flush ruleset，只声明/删除自有表，绝不触碰 Docker 自身的 NAT/masquerade
@@ -190,8 +206,50 @@ jobs:
           hev-socks5-tproxy /etc/tproxy.yaml &
           sleep 1
 
-          # ===== 8. dnsproxy（root；:53 -> 上游 DoH:443，会被 tproxy 隧道化，防 DNS 泄漏）=====
-          exec dnsproxy -l 0.0.0.0 -p 53 -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query
+          # ===== 8. 隐私加固：追加运行期自定义遥测黑名单（EXTRA_BLOCKED_HOSTS，逗号分隔域名，可选）=====
+          TELEMETRY_HOSTS_FILE=/etc/telemetry-block.hosts
+          if [ -n "${EXTRA_BLOCKED_HOSTS}" ]; then
+              cp /etc/telemetry-block.hosts /tmp/telemetry-block.hosts
+              _old_ifs="${IFS}"
+              set -f   # 禁用通配符展开，防止条目里的 */?/[ 触发意外的路径名展开
+              IFS=','
+              for _h in ${EXTRA_BLOCKED_HOSTS}; do
+                  # 仅接受合法域名：字母/数字/连字符/点，且不含首尾点/连字符、连续点、
+                  # 连字符紧邻点等非法形态，防止把非法内容注入 hosts 文件
+                  case "${_h}" in
+                      "") ;;
+                      *[!a-zA-Z0-9.-]*)   # 含合法字符集之外的字符(如空格/通配符/分号)
+                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                          ;;
+                      .*|*.)              # 以点开头或结尾
+                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                          ;;
+                      *..*)               # 含连续两个点(空标签)
+                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                          ;;
+                      -*|*-)              # 以连字符开头或结尾
+                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                          ;;
+                      *.-*|*-.*)          # 某个标签以连字符紧邻点(如 a.-b.com / a-.b.com)
+                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                          ;;
+                      *)
+                          echo "0.0.0.0 ${_h}" >> /tmp/telemetry-block.hosts
+                          ;;
+                  esac
+              done
+              set +f
+              IFS="${_old_ifs}"
+              TELEMETRY_HOSTS_FILE=/tmp/telemetry-block.hosts
+              echo "[entrypoint] extra blocked hosts: ${EXTRA_BLOCKED_HOSTS}"
+          fi
+
+          # ===== 9. dnsproxy（root；:53 -> 上游 DoH:443，会被 tproxy 隧道化，防 DNS 泄漏）=====
+          #    --hosts-file-enabled + --hosts-files：内置的 Claude Code/Statsig 遥测域名
+          #    解析到 0.0.0.0（连接失败），在 DNS 层面兜底拦截遥测上报，不依赖应用侧开关。
+          exec dnsproxy -l 0.0.0.0 -p 53 \
+              --hosts-file-enabled --hosts-files="${TELEMETRY_HOSTS_FILE}" \
+              -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query
           ENTRY
 
           RUN chmod +x /entrypoint.sh
@@ -246,6 +304,15 @@ jobs:
           ENV CLAUDE_CONFIG_DIR=/home/node/.claude
           ENV PATH="/home/node/.local/bin:$PATH"
 
+          # ── 隐私加固：默认禁用遥测/错误上报/自动更新等非必要出网流量 ──────────
+          #   DISABLE_TELEMETRY：关闭使用数据/统计上报（Statsig）
+          #   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC：官方"一键"开关，除遥测外一并
+          #     关闭错误上报(Sentry)、反馈调查、自动更新检查——容器每次都基于固定镜像
+          #     版本重建，本就不依赖运行期自动更新，关闭它也不会带来实际功能损失。
+          #   两个变量都可在 docker-compose.yml 的 claude.environment 中覆盖/关闭。
+          ENV DISABLE_TELEMETRY=1
+          ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
           # ── 全程以 node 用户身份安装并运行 Claude Code ───────────────────────────
           # binary 落在 /home/node/.local/bin/claude（原生安装预期路径）
           USER node
@@ -256,7 +323,11 @@ jobs:
           # 已实测验证（claude-code 2.1.x）：CLAUDE_CONFIG_DIR 一旦设置，.claude.json 以及
           # OAuth 凭据(.credentials.json)、backups/、sessions/、projects/、telemetry/ 等
           # 全部落在该目录内，不再写到 $HOME 根目录，因此清空 .claude/ 即可覆盖全部状态。
-          RUN rm -rf /home/node/.claude/*
+          # 注：.claude.json 本身也是隐藏文件；这是 POSIX shell 的通配符规则——`*` 默认不匹配
+          # 以点(.)开头的文件名(需要显式加 dotglob/nullglob 之类选项才会匹配)，所以
+          # `rm -rf .claude/*` 这种写法不会删除 .claude.json，必须整个目录删除重建，
+          # 否则该隐藏文件会被误留在镜像里。
+          RUN rm -rf /home/node/.claude && mkdir -p /home/node/.claude
 
           WORKDIR /workspace
 
@@ -304,6 +375,12 @@ jobs:
           #
           # ★ opt_data：默认挂载到 /opt，用于保存环境专用工具链（如手动安装的 SDK / 运行时），
           #   避免随容器重建丢失。
+          #
+          # ★ 隐私加固：claude 容器默认设置 DISABLE_TELEMETRY=1 与
+          #   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1（关闭遥测/错误上报/自动更新检查）；
+          #   proxy 容器额外在 DNS 层拦截 statsig.anthropic.com 等已知遥测域名（解析到
+          #   0.0.0.0），双重防护。如需临时放开，删掉/清空对应环境变量即可。
+          #   如需拦截更多域名，在 proxy 的 EXTRA_BLOCKED_HOSTS 里追加，用逗号分隔。
 
           name: claude-code
 
@@ -329,6 +406,8 @@ jobs:
                 - SOCKS5_PASSWORD=
                 # UDP 转发模式 udp|tcp；上游不支持 UDP 也不影响 Claude(纯 TCP/HTTPS)
                 - SOCKS5_UDP=tcp
+                # 额外自定义要拦截的遥测/统计域名，逗号分隔，追加到内置黑名单之后
+                - EXTRA_BLOCKED_HOSTS=
               restart: unless-stopped
               healthcheck:
                 test: ["CMD", "curl", "-fsS", "-I", "https://www.google.com"]
@@ -353,6 +432,11 @@ jobs:
                   restart: false
               stdin_open: true
               tty: true
+
+              environment:
+                # ── 隐私加固：默认关闭遥测/错误上报/自动更新（镜像内已设为 1，这里显式列出方便按需覆盖）──
+                - DISABLE_TELEMETRY=1
+                - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
               volumes:
                 - .:/workspace
