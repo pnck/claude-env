@@ -9,7 +9,14 @@ nftables (fwmark 1 / SO_MARK 0x438)
   → hev-socks5-tproxy :1088   （透明代理，接管 TCP+UDP）
   → 宿主机 SOCKS5              （默认 = 与容器同链路的宿主机 IP:1080）
 
-dnsproxy :53 → DoH (8.8.8.8 / 1.1.1.1)   ← 经上述隧道转发，防 DNS 泄漏
+dnsmasq :53 （前端）
+  → addn-hosts（遥测屏蔽）
+  → nftset（NO_PROXY_DOMAINS 解析结果写入 noproxy_ips）
+  → dnsproxy 127.0.0.1:5353 （纯 DoH 转发）
+  → DoH (8.8.8.8 / 1.1.1.1)   ← 经上述隧道转发，防 DNS 泄漏
+
+nftables output:
+  ip daddr @noproxy_ips return   （域名/IP 命中直连集合：不打标、不进隧道）
 
 claude 容器  network_mode: service:proxy   （共享 proxy 网络栈，无需应用侧配置）
 ```
@@ -94,12 +101,34 @@ environment:
 
 设为 `1` 即放开对应一类域名的屏蔽；两者相互独立，可分别开启。
 
+## 域名/IP 级直连绕过
+
+当 `ANTHROPIC_BASE_URL` 指向走 CDN 的自定义 LLM Endpoint 时，后端 IP 常常频繁变化，静态 CIDR 白名单难以维护。`proxy` 服务提供两种直连绕过方式：
+
+- `NO_PROXY_DOMAINS`：逗号分隔域名列表。dnsmasq 在解析时通过 `nftset=` 把 A 记录原子写入 `noproxy_ips` 集合；域名天然匹配全部子域名，无需通配符。允许最多一个前导点/尾随点（如 `.example.com`、`example.com.`），会自动归一化去掉。
+- `NO_PROXY_IPS`：逗号分隔静态 IPv4/CIDR 条目。容器启动时通过 `nft add element` 直接写入 `noproxy_ips`，不依赖 DNS。
+
+> 注意：本容器不支持 IPv6（内核层面已禁用 `net.ipv6.conf.all.disable_ipv6=1` 等 sysctl），`NO_PROXY_IPS` 中的 IPv6 条目会被检测并忽略（stderr 警告）。
+
+示例：
+
+```yaml
+services:
+  proxy:
+    environment:
+      # CDN 场景：按域名动态直连（自动覆盖子域名）
+      - NO_PROXY_DOMAINS=api.anthropic.example.com,cdn.example.net.
+      # 静态直连 IPv4/CIDR
+      - NO_PROXY_IPS=104.18.0.0/16,203.0.113.10
+```
+
 ## 技术栈
 
 | 组件 | 版本 |
 |------|------|
 | [hev-socks5-tproxy](https://github.com/heiher/hev-socks5-tproxy) | 2.11.0 |
 | [dnsproxy](https://github.com/AdguardTeam/dnsproxy) | 0.81.4 |
+| dnsmasq | 随 Debian trixie 源 |
 | node | 24-slim |
 
 ---
@@ -112,7 +141,11 @@ nftables 在 `output` 链给所有非本地、非 DNS 的 TCP/UDP 流量打 `fwm
 hev 自己到上游 SOCKS5 的连接带 `SO_MARK 0x438`，在 nft 里用 `meta mark 0x438 return` 放行——无论上游是私有 IP 还是公网 IP 都不会被重新隧道化，从而避免回环。这套按 mark 放行的机制也意味着容器里不区分任何 UID，`claude`（node, UID 1000）的全部出站都会被正确隧道化。
 
 **DNS**
-容器内所有 `:53` 查询被 nft（nat 链）重定向到本地 `dnsproxy`，由它通过 DoH（HTTPS:443）向 8.8.8.8 / 1.1.1.1 发起解析，而这条 HTTPS 又会被透明代理走隧道——既防 DNS 泄漏，也不依赖上游 SOCKS5 是否支持 UDP。`dnsproxy` 同时启用了内置的遥测域名 hosts 拦截（见上文「隐私加固」）。
+容器内所有 `:53` 查询被 nft（nat 链）重定向到本地 `dnsmasq`。`dnsmasq` 作为前端负责两件事：一是通过 `addn-hosts=` 加载遥测屏蔽 hosts 文件；二是把其余查询转发到 `127.0.0.1:5353` 的 `dnsproxy`，再由后者走 DoH（HTTPS:443）访问 8.8.8.8 / 1.1.1.1。这样 DNS 仍然经透明代理隧道转发，避免泄漏，且不依赖上游 SOCKS5 的 UDP 能力。
+
+当配置 `NO_PROXY_DOMAINS` 时，dnsmasq 会为匹配域名输出 `nftset=/domain/4#ip#tproxy_mangle#noproxy_ips`，在解析时把 A 记录写入 `noproxy_ips`。后续到这些 IP 的连接会命中 nftables 的 `ip daddr @noproxy_ips return`，直接放行（不打 fwmark、不进 tproxy 隧道）。
+
+`NO_PROXY_IPS` 则是在启动阶段通过 `nft add element` 静态写入同一个 `noproxy_ips` 集合，不经过 DNS 解析流程。
 
 **自动探测宿主机**
 `SOCKS5_SERVER` 留空时，entrypoint 用 `ip route show default` 取默认网关。在 Docker 网桥模式下，默认网关就是宿主机在该网桥上的地址，因此「与容器同链路的宿主机 IP」无需手填。
