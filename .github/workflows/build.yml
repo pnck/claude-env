@@ -32,7 +32,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 1. 动态生成 Proxy Dockerfile（tproxy + dnsproxy，复用【宿主机】上的 SOCKS5）
+      # 1. 动态生成 Proxy Dockerfile（tproxy + dnsmasq/dnsproxy，复用【宿主机】上的 SOCKS5）
       #    与旧版相比：不再编译/下载 shadowsocks-rust 与 xray-plugin，
       #    隧道由宿主机上现成的 SOCKS5 提供，proxy 容器只负责“透明代理 → 上游 SOCKS5”。
       #    仍用 ARG TARGETARCH（buildx 注入）为 dnsproxy 选对应架构的预编译二进制。
@@ -62,7 +62,7 @@ jobs:
           COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
 
           # ── 隐私加固：内置遥测域名黑名单（构建期写死，运行期可用 EXTRA_BLOCKED_HOSTS 追加）──
-          #   dnsproxy 原生支持 --hosts-file-enabled + --hosts-files 做 hosts 风格覆盖解析；
+          #   运行期由 dnsmasq 通过 addn-hosts= 加载该 hosts 风格文件；
           #   把已知的 Claude Code / Statsig 遥测域名解析到 0.0.0.0，使其连接失败，从
           #   DNS 层面兜底拦截（即便应用侧遥测开关被绕过或后续版本新增遥测调用也能生效）。
           #   参考：2026 年社区对 Claude Code 遥测依赖 Statsig(现为 OpenAI 旗下产品)的隐私讨论。
@@ -89,7 +89,7 @@ jobs:
           #    - 回环防护改为【按 SO_MARK】：hev 到上游 SOCKS5 的连接带 mark 0x438，
           #      在 output 链 "meta mark 0x438 return" 放行。无论上游 SOCKS5 是私有还是
           #      公网地址都不会被重新隧道化，也彻底摆脱了旧版“代理 UID 不能撞 1000”的限制。
-          #    - tproxy_nat：把容器内所有 :53 查询重定向到本地 dnsproxy（防 DNS 泄漏）
+          #    - tproxy_nat：把容器内所有 :53 查询重定向到本地 dnsmasq（防 DNS 泄漏）
           RUN cat <<'PROXY_NFT' > /etc/proxy.nft
           table ip tproxy_mangle {
               # 动态直连 IP 集合（由 dnsmasq nftset 写入，带 TTL；NO_PROXY_IPS 静态写入）
