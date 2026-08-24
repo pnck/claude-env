@@ -129,37 +129,34 @@ jobs:
               }
           }
 
-          table ip6 tproxy_mangle {
-              # IPv6 动态直连地址集合（由 dnsmasq nftset AAAA 写入，带 TTL；NO_PROXY_IPS IPv6 静态写入）
-              set noproxy_ips6 {
-                  type ipv6_addr
-                  flags interval,timeout
-              }
-              chain prerouting {
-                  type filter hook prerouting priority mangle; policy accept;
-                  # 被 output 打标并经 lo 重新注入的本机 IPv6 流量，投递给 hev 监听端口
-                  iif "lo" meta mark 1 meta l4proto { tcp, udp } tproxy to :1088 accept
-              }
-              chain output {
-                  type route hook output priority mangle; policy accept;
-                  # hev 到上游 SOCKS5 的连接放行（防止 IPv6 回环，同 IPv4 逻辑）
-                  meta mark 0x438 return
-                  # DNS 由 dnsmasq 处理，不经 tproxy
-                  meta l4proto { tcp, udp } th dport 53 return
-                  # IPv6 link-local / loopback 直连
-                  ip6 daddr { ::1, fe80::/10 } return
-                  # IPv6 直连白名单
-                  ip6 daddr @noproxy_ips6 return
-                  # 其余打标 → ip6 rule 送 table 100 → 回到 prerouting
-                  meta l4proto { tcp, udp } mark set 1 accept
-              }
-          }
+          # 不支持 IPv6：容器内 IPv6 流量一律不建立任何转发规则（既不 tproxy 也不放行直连），
+          # 依赖下方 6. 关闭 net.ipv6.conf.all.disable_ipv6，从内核层面彻底禁用，避免 DNS/流量泄漏。
           PROXY_NFT
 
           # ── entrypoint（构建期写死；tproxy.yaml 在运行期按环境变量生成）──────
           RUN cat <<'ENTRY' > /entrypoint.sh
           #!/bin/bash
           set -e
+
+          # 校验并归一化域名：合法则把归一化后的域名打印到 stdout 并返回 0；非法则返回 1（无输出）。
+          # - 允许一个前导点和/或一个尾随点（如 ".a.com" / "a.com."），会被去掉后按裸域名处理：
+          #   dnsmasq 的域名类指令（server=/address=/nftset=）本身就隐式匹配该域名及其所有子域名，
+          #   无需用户额外用通配符表达“包含子域名”。
+          # - 其余非法形态（非法字符、连续点、连字符紧邻点/开头/结尾等）一律拒绝，防止把非法
+          #   内容注入 hosts 文件或 dnsmasq 配置。
+          normalize_domain() {
+              _nd="$1"
+              _nd="${_nd#.}"
+              _nd="${_nd%.}"
+              case "${_nd}" in
+                  "") return 1 ;;
+                  *[!a-zA-Z0-9.-]*) return 1 ;;   # 含合法字符集之外的字符(如空格/通配符/分号)
+                  *..*) return 1 ;;               # 含连续两个点(空标签)
+                  -*|*-) return 1 ;;              # 以连字符开头或结尾
+                  *.-*|*-.*) return 1 ;;          # 某个标签以连字符紧邻点(如 a.-b.com / a-.b.com)
+                  *) printf '%s' "${_nd}"; return 0 ;;
+              esac
+          }
 
           # ===== 1. 确定上游 SOCKS5（宿主机上已有的代理）=====
           # SOCKS5_SERVER 留空 → 自动探测“与本容器同链路的宿主机 IP”(默认网关)
@@ -207,10 +204,10 @@ jobs:
               fi
               echo "tcp:"
               echo "  port: 1088"
-              echo "  address: '::'"
+              echo "  address: '0.0.0.0'"
               echo "udp:"
               echo "  port: 1088"
-              echo "  address: '::'"
+              echo "  address: '0.0.0.0'"
           } > /etc/tproxy.yaml
 
           # ===== 3. resolv.conf 指向本地 dnsmasq =====
@@ -229,18 +226,18 @@ jobs:
           sysctl -w net.ipv4.conf.all.route_localnet=1   2>/dev/null || true
           sysctl -w net.ipv4.conf.all.rp_filter=0        2>/dev/null || true
           sysctl -w net.ipv4.conf.lo.rp_filter=0         2>/dev/null || true
+          # 不支持 IPv6：直接在内核层面关闭，从根源避免 IPv6 流量绕过 tproxy 泄漏
+          sysctl -w net.ipv6.conf.all.disable_ipv6=1     2>/dev/null || true
+          sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
 
           # ===== 6. 加载 tproxy 规则（只删自有表，不动 Docker 规则）=====
           nft 'delete table ip tproxy_mangle'  2>/dev/null || true
           nft 'delete table ip tproxy_nat'     2>/dev/null || true
-          nft 'delete table ip6 tproxy_mangle' 2>/dev/null || true
           nft -f /etc/proxy.nft
           ip  rule  add fwmark 1 table 100 2>/dev/null || true
           ip  route add local default dev lo table 100 2>/dev/null || true
-          ip6 rule  add fwmark 1 table 100 2>/dev/null || true
-          ip6 route add local default dev lo table 100 2>/dev/null || true
 
-          # ===== 6.5. 静态直连 IP/CIDR（NO_PROXY_IPS，逗号分隔，可选）=====
+          # ===== 6.5. 静态直连 IP/CIDR（NO_PROXY_IPS，逗号分隔，可选；仅支持 IPv4，本容器不支持 IPv6）=====
           if [ -n "${NO_PROXY_IPS}" ]; then
               _old_ifs="${IFS}"
               set -f
@@ -249,10 +246,7 @@ jobs:
                   case "${_ip}" in
                       "") ;;
                       *:*)
-                          # IPv6 地址（含冒号）→ 写入 ip6 set
-                          nft add element ip6 tproxy_mangle noproxy_ips6 "{ ${_ip} }" 2>/dev/null && \
-                              echo "[entrypoint] NO_PROXY_IPS: 静态直连 IPv6 ${_ip}" || \
-                              echo "[entrypoint] WARN: 无法添加静态直连 IPv6 '${_ip}'" >&2
+                          echo "[entrypoint] WARN: 忽略 IPv6 地址 '${_ip}'（本容器不支持 IPv6，已在内核层面关闭）" >&2
                           ;;
                       *)
                           # IPv4 地址/CIDR → 写入 ip set
@@ -282,29 +276,12 @@ jobs:
               set -f
               IFS=','
               for _h in ${EXTRA_BLOCKED_HOSTS}; do
-                  # 仅接受合法域名：字母/数字/连字符/点，且不含首尾点/连字符、连续点、
-                  # 连字符紧邻点等非法形态，防止把非法内容注入 hosts 文件
-                  case "${_h}" in
-                      "") ;;
-                      *[!a-zA-Z0-9.-]*)   # 含合法字符集之外的字符(如空格/通配符/分号)
-                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
-                          ;;
-                      .*|*.)              # 以点开头或结尾
-                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
-                          ;;
-                      *..*)               # 含连续两个点(空标签)
-                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
-                          ;;
-                      -*|*-)              # 以连字符开头或结尾
-                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
-                          ;;
-                      *.-*|*-.*)          # 某个标签以连字符紧邻点(如 a.-b.com / a-.b.com)
-                          echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
-                          ;;
-                      *)
-                          echo "0.0.0.0 ${_h}" >> /tmp/telemetry-block.hosts
-                          ;;
-                  esac
+                  [ -z "${_h}" ] && continue
+                  if _h_norm="$(normalize_domain "${_h}")"; then
+                      echo "0.0.0.0 ${_h_norm}" >> /tmp/telemetry-block.hosts
+                  else
+                      echo "[entrypoint] WARN: 忽略非法域名 '${_h}'" >&2
+                  fi
               done
               set +f
               IFS="${_old_ifs}"
@@ -343,28 +320,14 @@ jobs:
                   set -f
                   IFS=','
                   for _d in ${NO_PROXY_DOMAINS}; do
-                      case "${_d}" in
-                          "") ;;
-                          *[!a-zA-Z0-9.-]*)
-                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
-                              ;;
-                          .*|*.)
-                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
-                              ;;
-                          *..*)
-                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
-                              ;;
-                          -*|*-)
-                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
-                              ;;
-                          *.-*|*-.*)
-                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
-                              ;;
-                          *)
-                              echo "nftset=/${_d}/4#ip#tproxy_mangle#noproxy_ips,6#ip6#tproxy_mangle#noproxy_ips6"
-                              echo "[entrypoint] NO_PROXY_DOMAINS: 直连域名 ${_d}" >&2
-                              ;;
-                      esac
+                      [ -z "${_d}" ] && continue
+                      if _d_norm="$(normalize_domain "${_d}")"; then
+                          # 仅写 IPv4(#4#) 的 nftset：本容器不支持 IPv6，AAAA 记录不做处理
+                          echo "nftset=/${_d_norm}/4#ip#tproxy_mangle#noproxy_ips"
+                          echo "[entrypoint] NO_PROXY_DOMAINS: 直连域名 ${_d_norm}" >&2
+                      else
+                          echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                      fi
                   done
                   set +f
                   IFS="${_old_ifs}"
@@ -523,7 +486,13 @@ jobs:
           #   ALLOW_ANTHROPIC_TELEMETRY / ALLOW_SENTRY 设为 1（默认 0，即仍屏蔽）。
           #   如需让特定域名走直连（不经 tproxy 隧道），在 proxy 的 NO_PROXY_DOMAINS 里
           #   填入逗号分隔的域名列表；dnsmasq 会在解析时把 IP 写入 nft set，实现动态直连。
-          #   如需静态 IP/CIDR 直连，在 proxy 的 NO_PROXY_IPS 里填入逗号分隔的条目。
+          #   域名本身即隐式包含其所有子域名，无需额外加通配符（允许带最多一个前导/尾随
+          #   点，如 ".example.com" 或 "example.com."，会被自动去掉后按裸域名处理）。
+          #   如需静态 IP/CIDR 直连，在 proxy 的 NO_PROXY_IPS 里填入逗号分隔的条目
+          #   （仅支持 IPv4/IPv4 CIDR）。
+          #
+          # ★ 不支持 IPv6：本方案仅处理 IPv4 流量，proxy 容器已在内核层面关闭 IPv6
+          #   （net.ipv6.conf.all.disable_ipv6=1），NO_PROXY_IPS 中的 IPv6 地址会被忽略。
 
           name: claude-code
 
@@ -554,10 +523,11 @@ jobs:
                 # 临时放开内置屏蔽（默认 0=仍屏蔽；设为 1 放开对应一类域名）
                 - ALLOW_ANTHROPIC_TELEMETRY=0
                 - ALLOW_SENTRY=0
-                # 域名直连白名单（逗号分隔域名，解析结果自动写入 nft set，不经隧道）
+                # 域名直连白名单（逗号分隔域名，解析结果自动写入 nft set，不经隧道；
+                # 天然包含子域名，无需通配符；可带最多一个前导/尾随点）
                 # 典型场景：ANTHROPIC_BASE_URL 指向走 CDN 的自定义 LLM Endpoint
                 - NO_PROXY_DOMAINS=
-                # 静态直连 IP/CIDR 白名单（逗号分隔，无需 DNS 联动）
+                # 静态直连 IP/CIDR 白名单（逗号分隔，无需 DNS 联动；仅支持 IPv4，本方案不支持 IPv6）
                 - NO_PROXY_IPS=
               restart: unless-stopped
               healthcheck:
