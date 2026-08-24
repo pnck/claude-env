@@ -56,7 +56,7 @@ jobs:
 
           FROM debian:trixie-slim
           #   procps 提供 sysctl；nftables/iproute2 做规则与策略路由；curl 供 healthcheck
-          RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 ca-certificates curl procps && rm -rf /var/lib/apt/lists/*
+          RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 ca-certificates curl procps dnsmasq && rm -rf /var/lib/apt/lists/*
 
           COPY --from=builder /src/bin/hev-socks5-tproxy /usr/local/bin/
           COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
@@ -92,6 +92,11 @@ jobs:
           #    - tproxy_nat：把容器内所有 :53 查询重定向到本地 dnsproxy（防 DNS 泄漏）
           RUN cat <<'PROXY_NFT' > /etc/proxy.nft
           table ip tproxy_mangle {
+              # 动态直连 IP 集合（由 dnsmasq nftset 写入，带 TTL；NO_PROXY_IPS 静态写入）
+              set noproxy_ips {
+                  type ipv4_addr
+                  flags interval,timeout
+              }
               chain prerouting {
                   type filter hook prerouting priority mangle; policy accept;
                   # 被 output 打标并经 lo 重新注入的本机流量，投递给 hev 监听端口
@@ -101,10 +106,12 @@ jobs:
                   type route hook output priority mangle; policy accept;
                   # hev 到上游 SOCKS5 的连接(SO_MARK=0x438)直连放行，绝不回环
                   meta mark 0x438 return
-                  # DNS 交给下面的 nat 链重定向到本地 dnsproxy
+                  # DNS 交给下面的 nat 链重定向到本地 dnsmasq（:53）
                   meta l4proto { tcp, udp } th dport 53 return
                   # 本地/私有目标直连（含宿主机网关、LAN 上的 SOCKS5）
                   ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
+                  # 域名直连白名单（dnsmasq nftset 动态写入 + NO_PROXY_IPS 静态写入）
+                  ip daddr @noproxy_ips return
                   # 其余打标 → ip rule 送 table 100 → local default dev lo → 回到 prerouting
                   meta l4proto { tcp, udp } mark set 1 accept
               }
@@ -115,9 +122,9 @@ jobs:
                   type nat hook output priority dstnat; policy accept;
                   # hev 到上游 SOCKS5 的连接放行（万一上游端口恰为 53）
                   meta mark 0x438 return
-                  # 已指向本地 dnsproxy 的直接放行
+                  # 已指向本地 dnsmasq 的直接放行
                   ip daddr 127.0.0.1 return
-                  # 其它一切 :53 统一重定向到本机 dnsproxy(127.0.0.1:53)
+                  # 其它一切 :53 统一重定向到本机 dnsmasq(127.0.0.1:53)
                   meta l4proto { tcp, udp } th dport 53 redirect to :53
               }
           }
@@ -180,7 +187,7 @@ jobs:
               echo "  address: '0.0.0.0'"
           } > /etc/tproxy.yaml
 
-          # ===== 3. resolv.conf 指向本地 dnsproxy =====
+          # ===== 3. resolv.conf 指向本地 dnsmasq =====
           printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 
           # ===== 4. 上游可达性自检（非致命，仅提示）=====
@@ -205,6 +212,25 @@ jobs:
           nft -f /etc/proxy.nft
           ip rule add fwmark 1 table 100 2>/dev/null || true
           ip route add local default dev lo table 100 2>/dev/null || true
+
+          # ===== 6.5. 静态直连 IP/CIDR（NO_PROXY_IPS，逗号分隔，可选）=====
+          if [ -n "${NO_PROXY_IPS}" ]; then
+              _old_ifs="${IFS}"
+              set -f
+              IFS=','
+              for _ip in ${NO_PROXY_IPS}; do
+                  case "${_ip}" in
+                      "") ;;
+                      *)
+                          nft add element ip tproxy_mangle noproxy_ips "{ ${_ip} }" 2>/dev/null && \
+                              echo "[entrypoint] NO_PROXY_IPS: 静态直连 ${_ip}" || \
+                              echo "[entrypoint] WARN: 无法添加静态直连 IP '${_ip}'" >&2
+                          ;;
+                  esac
+              done
+              set +f
+              IFS="${_old_ifs}"
+          fi
 
           # ===== 7. 启动 hev-socks5-tproxy =====
           # 以 root 运行：透明监听(TPROXY)需要 CAP_NET_ADMIN(容器已 cap_add NET_ADMIN)。
@@ -268,12 +294,66 @@ jobs:
               TELEMETRY_HOSTS_FILE=/tmp/telemetry-block.hosts.filtered
           fi
 
-          # ===== 9. dnsproxy（root；:53 -> 上游 DoH:443，会被 tproxy 隧道化，防 DNS 泄漏）=====
-          #    --hosts-file-enabled + --hosts-files：内置的 Claude Code/Statsig 遥测域名
-          #    解析到 0.0.0.0（连接失败），在 DNS 层面兜底拦截遥测上报，不依赖应用侧开关。
-          exec dnsproxy -l 0.0.0.0 -p 53 \
-              --hosts-file-enabled --hosts-files="${TELEMETRY_HOSTS_FILE}" \
-              -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query
+          # ===== 9. 生成 dnsmasq.conf =====
+          #   - addn-hosts: 复用遥测域名 hosts 文件（0.0.0.0 拦截）
+          #   - nftset: NO_PROXY_DOMAINS 域名的 A 记录同步写入 nft set，实现动态直连
+          #   - server: 其余查询转发给本地 dnsproxy(127.0.0.1:5353) 做 DoH
+          {
+              echo "no-resolv"
+              echo "no-hosts"
+              echo "port=53"
+              echo "server=127.0.0.1#5353"
+              echo "addn-hosts=${TELEMETRY_HOSTS_FILE}"
+              if [ -n "${NO_PROXY_DOMAINS}" ]; then
+                  _old_ifs="${IFS}"
+                  set -f
+                  IFS=','
+                  for _d in ${NO_PROXY_DOMAINS}; do
+                      case "${_d}" in
+                          "") ;;
+                          *[!a-zA-Z0-9.-]*)
+                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                              ;;
+                          .*|*.)
+                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                              ;;
+                          *..*)
+                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                              ;;
+                          -*|*-)
+                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                              ;;
+                          *.-*|*-.*)
+                              echo "[entrypoint] WARN: 忽略非法直连域名 '${_d}'" >&2
+                              ;;
+                          *)
+                              echo "nftset=/${_d}/4#ip#tproxy_mangle#noproxy_ips"
+                              echo "[entrypoint] NO_PROXY_DOMAINS: 直连域名 ${_d}" >&2
+                              ;;
+                      esac
+                  done
+                  set +f
+                  IFS="${_old_ifs}"
+              fi
+          } > /etc/dnsmasq.conf
+
+          # ===== 10. 启动 dnsproxy（仅监听 127.0.0.1:5353，供 dnsmasq 转发 DoH）=====
+          dnsproxy -l 127.0.0.1 -p 5353 \
+              -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query &
+          # 等待 dnsproxy 就绪（最多 10 秒）
+          _tries=0
+          until (exec 3<>"/dev/udp/127.0.0.1/5353") 2>/dev/null; do
+              _tries=$((_tries + 1))
+              if [ "${_tries}" -ge 20 ]; then
+                  echo "[entrypoint] WARN: dnsproxy 未在 10 秒内就绪" >&2
+                  break
+              fi
+              sleep 0.5
+          done
+          exec 3>&- 2>/dev/null || true
+
+          # ===== 11. 启动 dnsmasq（:53 前端；遥测屏蔽 + 域名直连联动 nftset）=====
+          exec dnsmasq --no-daemon --conf-file=/etc/dnsmasq.conf
           ENTRY
 
           RUN chmod +x /entrypoint.sh
@@ -407,6 +487,9 @@ jobs:
           #   如需拦截更多域名，在 proxy 的 EXTRA_BLOCKED_HOSTS 里追加，用逗号分隔。
           #   如需单独放开内置屏蔽的 Anthropic/Statsig 遥测或 Sentry 域名，把 proxy 的
           #   ALLOW_ANTHROPIC_TELEMETRY / ALLOW_SENTRY 设为 1（默认 0，即仍屏蔽）。
+          #   如需让特定域名走直连（不经 tproxy 隧道），在 proxy 的 NO_PROXY_DOMAINS 里
+          #   填入逗号分隔的域名列表；dnsmasq 会在解析时把 IP 写入 nft set，实现动态直连。
+          #   如需静态 IP/CIDR 直连，在 proxy 的 NO_PROXY_IPS 里填入逗号分隔的条目。
 
           name: claude-code
 
@@ -437,6 +520,11 @@ jobs:
                 # 临时放开内置屏蔽（默认 0=仍屏蔽；设为 1 放开对应一类域名）
                 - ALLOW_ANTHROPIC_TELEMETRY=0
                 - ALLOW_SENTRY=0
+                # 域名直连白名单（逗号分隔域名，解析结果自动写入 nft set，不经隧道）
+                # 典型场景：ANTHROPIC_BASE_URL 指向走 CDN 的自定义 LLM Endpoint
+                - NO_PROXY_DOMAINS=
+                # 静态直连 IP/CIDR 白名单（逗号分隔，无需 DNS 联动）
+                - NO_PROXY_IPS=
               restart: unless-stopped
               healthcheck:
                 test: ["CMD", "curl", "-fsS", "-I", "https://www.google.com"]
