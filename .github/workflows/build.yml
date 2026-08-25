@@ -33,9 +33,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # 1. 动态生成 Proxy Dockerfile（tproxy + dnsmasq/dnsproxy，复用【宿主机】上的 SOCKS5）
-      #    与旧版相比：不再编译/下载 shadowsocks-rust 与 xray-plugin，
       #    隧道由宿主机上现成的 SOCKS5 提供，proxy 容器只负责“透明代理 → 上游 SOCKS5”。
-      #    仍用 ARG TARGETARCH（buildx 注入）为 dnsproxy 选对应架构的预编译二进制。
+      #    用 ARG TARGETARCH（buildx 注入）为 dnsproxy 选对应架构的预编译二进制。
       - name: Generate Proxy Dockerfile
         run: |
           cat << 'EOF' > Dockerfile.proxy
@@ -57,6 +56,8 @@ jobs:
           FROM debian:trixie-slim
           #   procps 提供 sysctl；nftables/iproute2 做规则与策略路由；curl 供 healthcheck
           RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 ca-certificates curl procps dnsmasq && rm -rf /var/lib/apt/lists/*
+          # dnsdir：专用于直连 DNS 解析器（NO_PROXY_DOMAINS 路径），nftables 通过 UID 1001 放行其出站流量
+          RUN useradd -r -u 1001 -s /usr/sbin/nologin dnsdir
 
           COPY --from=builder /src/bin/hev-socks5-tproxy /usr/local/bin/
           COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
@@ -86,9 +87,9 @@ jobs:
           # ── 内置静态文件：nftables 规则（构建期写死）──────────────────────
           #    要点：
           #    - 不 flush ruleset，只声明/删除自有表，绝不触碰 Docker 自身的 NAT/masquerade
-          #    - 回环防护改为【按 SO_MARK】：hev 到上游 SOCKS5 的连接带 mark 0x438，
+          #    - 回环防护按 SO_MARK：hev 到上游 SOCKS5 的连接带 mark 0x438，
           #      在 output 链 "meta mark 0x438 return" 放行。无论上游 SOCKS5 是私有还是
-          #      公网地址都不会被重新隧道化，也彻底摆脱了旧版“代理 UID 不能撞 1000”的限制。
+          #      公网地址都不会被重新隧道化。
           #    - tproxy_nat：把容器内所有 :53 查询重定向到本地 dnsmasq（防 DNS 泄漏）
           RUN cat <<'PROXY_NFT' > /etc/proxy.nft
           table ip tproxy_mangle {
@@ -107,6 +108,8 @@ jobs:
                   # hev 到上游 SOCKS5 的连接(SO_MARK=0x438)直连放行，绝不回环
                   meta mark 0x438 return
                   # DNS 交给下面的 nat 链重定向到本地 dnsmasq（:53）
+                  # 注：本规则已按端口放行全部 :53 流量而不区分 UID，
+                  # 因此直连 DNS 解析器(dnsdir UID 1001)的查询在本链天然不会被打标，无需额外按 UID 放行
                   meta l4proto { tcp, udp } th dport 53 return
                   # 本地/私有目标直连（含宿主机网关、LAN 上的 SOCKS5）
                   ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
@@ -122,6 +125,9 @@ jobs:
                   type nat hook output priority dstnat; policy accept;
                   # hev 到上游 SOCKS5 的连接放行（万一上游端口恰为 53）
                   meta mark 0x438 return
+                  # 直连 DNS 解析器(dnsdir UID 1001)出站放行，不重定向到本地 dnsmasq
+                  # （否则其发往真实 DHCP DNS 的 :53 查询会被本规则错误地打回本机）
+                  meta skuid 1001 return
                   # 已指向本地 dnsmasq 的直接放行
                   ip daddr 127.0.0.1 return
                   # 其它一切 :53 统一重定向到本机 dnsmasq(127.0.0.1:53)
@@ -157,6 +163,84 @@ jobs:
                   *) printf '%s' "${_nd}"; return 0 ;;
               esac
           }
+
+          # 等待本地 TCP 端口就绪（最多 10 秒），用于确认后台起的服务已开始监听
+          # 连接测试在子 shell 里做(exec 3<>...)，fd 3 不会泄漏到当前 shell，无需额外关闭
+          wait_port_ready() {
+              _wpr_port="$1"
+              _wpr_label="$2"
+              _wpr_tries=0
+              until (exec 3<>"/dev/tcp/127.0.0.1/${_wpr_port}") 2>/dev/null; do
+                  _wpr_tries=$((_wpr_tries + 1))
+                  if [ "${_wpr_tries}" -ge 20 ]; then
+                      echo "[entrypoint] WARN: ${_wpr_label} 未在 10 秒内就绪" >&2
+                      break
+                  fi
+                  sleep 0.5
+              done
+          }
+
+          # 校验是否为合法 IPv4 dotted-quad（四段 0-255 十进制数）
+          is_valid_ipv4() {
+              case "$1" in
+                  *[!0-9.]*) return 1 ;;
+              esac
+              _iv4_old_ifs="${IFS}"
+              IFS=.
+              # shellcheck disable=SC2086  # 借助 IFS=. 做字段拆分，需要不加引号
+              set -- $1
+              IFS="${_iv4_old_ifs}"
+              [ "$#" -eq 4 ] || return 1
+              for _iv4_octet in "$@"; do
+                  case "${_iv4_octet}" in
+                      ""|*[!0-9]*) return 1 ;;
+                  esac
+                  [ "${_iv4_octet}" -le 255 ] || return 1
+              done
+              return 0
+          }
+
+          # ===== 0. 在任何覆盖 resolv.conf 前，提取 DHCP 分配的 DNS 服务器 =====
+          # 这些 DNS 是容器/宿主机真实网络环境给的，直连解析（NO_PROXY_DOMAINS）应当使用它们，
+          # 而不是硬编码的公共 DNS，以免绕过内网/企业 DNS 或造成不必要的外部依赖。
+          # 必须在步骤 1（可能因解析 SOCKS5_SERVER 主机名而覆盖 resolv.conf）之前读取。
+          # 安全前提：_dhcp_ns_args 之后会被拼进 su -c 的命令字符串（见下方步骤 10.5），
+          # 只允许在通过 is_valid_ipv4 校验后才拼接 -u <ip>，不得从其它来源写入该变量。
+          _dhcp_ns_args=""
+          while IFS= read -r _line; do
+              case "${_line}" in
+                  nameserver\ *)
+                      _ns="${_line#nameserver }"
+                      _ns="${_ns%% *}"   # 去除行尾注释/多余空格
+                      # 跳过回环（容器自身的 dnsmasq）、空值
+                      case "${_ns}" in
+                          127.*|"") continue ;;
+                          # 本容器不支持 IPv6（已在内核层面关闭），跳过 DHCP 下发的 IPv6 DNS，
+                          # 与 NO_PROXY_IPS 对 IPv6 的处理方式保持一致
+                          *:*)
+                              echo "[entrypoint] WARN: 忽略 DHCP 下发的 IPv6 DNS '${_ns}'（本容器不支持 IPv6）" >&2
+                              continue
+                              ;;
+                      esac
+                      # 校验为合法 IPv4 dotted-quad 后才使用：随后会被拼进 su -c 的命令
+                      # 字符串，严格校验可防止 resolv.conf 中意外/恶意内容注入 shell 命令，
+                      # 也避免把畸形地址传给 dnsproxy
+                      if ! is_valid_ipv4 "${_ns}"; then
+                          echo "[entrypoint] WARN: 忽略格式非法的 DHCP DNS '${_ns}'" >&2
+                          continue
+                      fi
+                      _dhcp_ns_args="${_dhcp_ns_args:+${_dhcp_ns_args} }-u ${_ns}"
+                      echo "[entrypoint] DHCP DNS: ${_ns} (将用于直连解析器)"
+                      ;;
+              esac
+          done < /etc/resolv.conf
+          # 若 DHCP 未提供任何 DNS（罕见），降级使用公共 DNS 作为保底
+          if [ -z "${_dhcp_ns_args}" ]; then
+              echo "[entrypoint] WARN: 未从 resolv.conf 获取到 DHCP DNS，直连解析器降级使用 8.8.8.8 / 1.1.1.1" >&2
+              _dhcp_ns_args="-u 8.8.8.8 -u 1.1.1.1"
+          fi
+          # 定稿为只读：强制保证之后不会被其它来源覆盖写入，维持上面 su -c 拼接的安全前提
+          readonly _dhcp_ns_args
 
           # ===== 1. 确定上游 SOCKS5（宿主机上已有的代理）=====
           # SOCKS5_SERVER 留空 → 自动探测“与本容器同链路的宿主机 IP”(默认网关)
@@ -214,8 +298,8 @@ jobs:
           printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 
           # ===== 4. 上游可达性自检（非致命，仅提示）=====
+          # 连接测试在子 shell 里做(exec 3<>...)，fd 3 不会泄漏到当前 shell，无需额外关闭
           if (exec 3<>"/dev/tcp/${SOCKS5_SERVER}/${SOCKS5_PORT}") 2>/dev/null; then
-              exec 3>&-
               echo "[entrypoint] upstream reachable OK"
           else
               echo "[entrypoint] WARN: 连不到 ${SOCKS5_SERVER}:${SOCKS5_PORT}" >&2
@@ -307,7 +391,8 @@ jobs:
 
           # ===== 9. 生成 dnsmasq.conf =====
           #   - addn-hosts: 复用遥测域名 hosts 文件（0.0.0.0 拦截）
-          #   - nftset: NO_PROXY_DOMAINS 域名的 A 记录同步写入 nft set，实现动态直连
+          #   - server/nftset: NO_PROXY_DOMAINS 域名的查询转发给直连解析器(127.0.0.1:5354)，
+          #     并把 A 记录同步写入 nft set，实现动态直连（DNS 查询本身和连接均走直连）
           #   - server: 其余查询转发给本地 dnsproxy(127.0.0.1:5353) 做 DoH
           {
               echo "no-resolv"
@@ -322,6 +407,9 @@ jobs:
                   for _d in ${NO_PROXY_DOMAINS}; do
                       [ -z "${_d}" ] && continue
                       if _d_norm="$(normalize_domain "${_d}")"; then
+                          # 直连域名查询走独立直连解析器(127.0.0.1:5354，以 dnsdir UID 运行，nft 放行)
+                          # 这样 DNS 查询本身也从本机真实网络位置发出，GeoDNS/CDN 能选出正确的边缘节点
+                          echo "server=/${_d_norm}/127.0.0.1#5354"
                           # 仅写 IPv4(#4#) 的 nftset：本容器不支持 IPv6，AAAA 记录不做处理
                           echo "nftset=/${_d_norm}/4#ip#tproxy_mangle#noproxy_ips"
                           echo "[entrypoint] NO_PROXY_DOMAINS: 直连域名 ${_d_norm}" >&2
@@ -337,17 +425,17 @@ jobs:
           # ===== 10. 启动 dnsproxy（仅监听 127.0.0.1:5353，供 dnsmasq 转发 DoH）=====
           dnsproxy -l 127.0.0.1 -p 5353 \
               -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query &
-          # 等待 dnsproxy 就绪（最多 10 秒，TCP 连接验证服务已监听）
-          _tries=0
-          until (exec 3<>"/dev/tcp/127.0.0.1/5353") 2>/dev/null; do
-              _tries=$((_tries + 1))
-              if [ "${_tries}" -ge 20 ]; then
-                  echo "[entrypoint] WARN: dnsproxy 未在 10 秒内就绪" >&2
-                  break
-              fi
-              sleep 0.5
-          done
-          exec 3>&- 2>/dev/null || true
+          wait_port_ready 5353 "dnsproxy"
+
+          # ===== 10.5. 启动直连 DNS 解析器（127.0.0.1:5354，供 NO_PROXY_DOMAINS 域名查询直连使用）=====
+          # 以 dnsdir(UID 1001) 运行：nftables nat 链中 meta skuid 1001 return 放行，
+          # 该进程的出站 DNS 查询不被重定向到本地 dnsmasq，也天然不会在 mangle 链被打标(见 proxy.nft)。
+          # 上游使用容器从 DHCP 获取到的 DNS（启动前从 resolv.conf 读取），
+          # 从而以本机真实网络位置查询，让 GeoDNS/CDN 感知到容器真实出口 IP。
+          # _dhcp_ns_args 中的每个地址均已由 is_valid_ipv4 校验为合法 IPv4，才安全拼进此命令字符串
+          # shellcheck disable=SC2086
+          su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 ${_dhcp_ns_args}" &
+          wait_port_ready 5354 "直连 DNS 解析器"
 
           # ===== 11. 启动 dnsmasq（:53 前端；遥测屏蔽 + 域名直连联动 nftset）=====
           exec dnsmasq --no-daemon --conf-file=/etc/dnsmasq.conf
@@ -368,14 +456,12 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.PROXY_IMAGE }}:latest
 
       # 3. 动态生成 Claude Code 侧的 Dockerfile
-      #    简化方案：不再用 root entrypoint 运行期修属主/修复损坏的配置文件，
-      #    而是让命名卷挂载点在镜像内【预先归属 node】，命名卷首次创建时会
-      #    直接继承该属主，全程以 USER node 启动 claude 本体，无权限问题。
-      #    同时不再保留安装期生成的配置/机器标识文件，保证每次基于全新卷启动时
-      #    claude 都会重新生成配置（含新的 userId / machineId），不再考虑修复旧配置。
-      #    已实测验证：新版 claude code 在设置 CLAUDE_CONFIG_DIR 后，会把
-      #    .claude.json、OAuth 凭据、sessions/projects/telemetry 等全部配置文件
-      #    统一收纳进该目录，不再散落到 $HOME 根目录，因此单一命名卷
+      #    命名卷挂载点在镜像内【预先归属 node】，命名卷首次创建时会直接继承该属主，
+      #    全程以 USER node 启动 claude 本体，无需运行期 chown，无权限问题。
+      #    安装期生成的配置/机器标识文件会在下方删除，保证每次基于全新卷启动时
+      #    claude 都会重新生成配置（含新的 userId / machineId）。
+      #    设置 CLAUDE_CONFIG_DIR 后，claude 会把 .claude.json、OAuth 凭据、
+      #    sessions/projects/telemetry 等全部配置文件统一收纳进该目录，因此单一命名卷
       #    claude_config:/home/node/.claude 即可覆盖容器重建后需要保留的全部状态。
       - name: Generate Claude Dockerfile
         run: |
@@ -420,10 +506,10 @@ jobs:
           RUN curl -fsSL https://claude.ai/install.sh | bash
 
           # 删除安装过程中生成的配置文件/机器标识（如有），确保运行时挂载全新命名卷后
-          # claude 会重新生成全部配置（含新的 userId / machineId），不复用构建期状态。
-          # 已实测验证（claude-code 2.1.x）：CLAUDE_CONFIG_DIR 一旦设置，.claude.json 以及
-          # OAuth 凭据(.credentials.json)、backups/、sessions/、projects/、telemetry/ 等
-          # 全部落在该目录内，不再写到 $HOME 根目录，因此清空 .claude/ 即可覆盖全部状态。
+          # claude 会重新生成全部配置（含新的 userId / machineId）。
+          # CLAUDE_CONFIG_DIR 一旦设置，.claude.json 以及 OAuth 凭据(.credentials.json)、
+          # backups/、sessions/、projects/、telemetry/ 等全部落在该目录内，不再写到
+          # $HOME 根目录，因此清空 .claude/ 即可覆盖全部状态。
           # 注：.claude.json 本身也是隐藏文件；这是 POSIX shell 的通配符规则——`*` 默认不匹配
           # 以点(.)开头的文件名(需要显式加 dotglob/nullglob 之类选项才会匹配)，所以
           # `rm -rf .claude/*` 这种写法不会删除 .claude.json，必须整个目录删除重建，
@@ -509,7 +595,7 @@ jobs:
               extra_hosts:
                 - "host.docker.internal:host-gateway"
               environment:
-                # ── 上游 SOCKS5（宿主机上已有的代理；不再需要任何隧道明文密钥）──
+                # ── 上游 SOCKS5（宿主机上已有的代理）──
                 # 留空 = 自动探测与本容器同链路的宿主机 IP(默认网关)
                 - SOCKS5_SERVER=
                 - SOCKS5_PORT=1080
