@@ -166,6 +166,7 @@ jobs:
           }
 
           # 等待本地 TCP 端口就绪（最多 10 秒），用于确认后台起的服务已开始监听
+          # 连接测试在子 shell 里做(exec 3<>...)，fd 3 不会泄漏到当前 shell，无需额外关闭
           wait_port_ready() {
               _wpr_port="$1"
               _wpr_label="$2"
@@ -178,7 +179,6 @@ jobs:
                   fi
                   sleep 0.5
               done
-              exec 3>&- 2>/dev/null || true
           }
 
           # 校验是否为合法 IPv4 dotted-quad（四段 0-255 十进制数）
@@ -205,6 +205,8 @@ jobs:
           # 这些 DNS 是容器/宿主机真实网络环境给的，直连解析（NO_PROXY_DOMAINS）应当使用它们，
           # 而不是硬编码的公共 DNS，以免绕过内网/企业 DNS 或造成不必要的外部依赖。
           # 必须在步骤 1（可能因解析 SOCKS5_SERVER 主机名而覆盖 resolv.conf）之前读取。
+          # 安全前提：_dhcp_ns_args 之后会被拼进 su -c 的命令字符串（见下方步骤 10.5），
+          # 只允许在通过 is_valid_ipv4 校验后才拼接 -u <ip>，不得从其它来源写入该变量。
           _dhcp_ns_args=""
           while IFS= read -r _line; do
               case "${_line}" in
@@ -429,6 +431,7 @@ jobs:
           # 该进程的出站 DNS 查询不被重定向到本地 dnsmasq，也天然不会在 mangle 链被打标(见 proxy.nft)。
           # 上游使用容器从 DHCP 获取到的 DNS（启动前从 resolv.conf 读取），
           # 从而以本机真实网络位置查询，让 GeoDNS/CDN 感知到容器真实出口 IP。
+          # _dhcp_ns_args 中的每个地址均已由 is_valid_ipv4 校验为合法 IPv4，才安全拼进此命令字符串
           # shellcheck disable=SC2086
           su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 ${_dhcp_ns_args}" &
           wait_port_ready 5354 "直连 DNS 解析器"
