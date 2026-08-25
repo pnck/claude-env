@@ -12,7 +12,7 @@ nftables (fwmark 1 / SO_MARK 0x438)
 dnsmasq :53 （前端）
   → addn-hosts（遥测屏蔽）
   → 普通域名：dnsproxy 127.0.0.1:5353 → DoH (8.8.8.8/1.1.1.1)  ← 经隧道，防 DNS 泄漏
-  → NO_PROXY_DOMAINS：dnsproxy 127.0.0.1:5354（dnsdir UID）→ 明文 DNS 8.8.8.8/1.1.1.1  ← 直连
+  → NO_PROXY_DOMAINS：dnsproxy 127.0.0.1:5354（dnsdir UID）→ 明文 DNS（DHCP 分配的上游）  ← 直连
       + nftset 把 A 记录写入 noproxy_ips
 
 nftables output:
@@ -147,7 +147,7 @@ hev 自己到上游 SOCKS5 的连接带 `SO_MARK 0x438`，在 nft 里用 `meta m
 **NO_PROXY_DOMAINS 的完整直连路径**
 仅把 A 记录写入 `noproxy_ips` 是不够的——如果 DNS 查询本身也经过隧道，走 GeoDNS / EDNS Client Subnet 的 CDN 会以代理出口 IP 作为来源，返回离代理近而非离容器近的边缘节点，写入的 IP 从一开始就选错了。
 
-因此对 `NO_PROXY_DOMAINS` 中的域名，dnsmasq 把查询转发给**直连解析器**（`127.0.0.1:5354`）而非隧道化的 `dnsproxy`。直连解析器以专用 `dnsdir`（UID 1001）身份运行，nftables 对该 UID 的所有出站流量在两个链中都直接放行（mangle 链不打标、nat 链不重定向），从而以明文 DNS 直接访问 8.8.8.8 / 1.1.1.1，让上游感知到容器真实出口 IP。同时，解析结果 A 记录仍通过 `nftset=` 写入 `noproxy_ips`，使后续连接也走直连。
+因此对 `NO_PROXY_DOMAINS` 中的域名，dnsmasq 把查询转发给**直连解析器**（`127.0.0.1:5354`）而非隧道化的 `dnsproxy`。直连解析器以专用 `dnsdir`（UID 1001）身份运行，nftables 对该 UID 的所有出站流量在两个链中都直接放行（mangle 链不打标、nat 链不重定向）。其上游使用容器启动时从 `/etc/resolv.conf` 读取到的 **DHCP 分配 DNS**（即宿主机/网络环境给容器的 DNS，而非硬编码的公共 DNS），从而以本机真实网络位置发出查询，让 GeoDNS/CDN 感知到容器真实出口 IP，并能利用内网/企业 DNS。若 DHCP 未提供任何 DNS，则降级使用 8.8.8.8 / 1.1.1.1 作为保底。同时，解析结果 A 记录仍通过 `nftset=` 写入 `noproxy_ips`，使后续连接也走直连。
 
 `NO_PROXY_IPS` 则是在启动阶段通过 `nft add element` 静态写入同一个 `noproxy_ips` 集合，不经过 DNS 解析流程。
 

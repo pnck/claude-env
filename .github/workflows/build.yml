@@ -164,6 +164,31 @@ jobs:
               esac
           }
 
+          # ===== 0. 在任何覆盖 resolv.conf 前，提取 DHCP 分配的 DNS 服务器 =====
+          # 这些 DNS 是容器/宿主机真实网络环境给的，直连解析（NO_PROXY_DOMAINS）应当使用它们，
+          # 而不是硬编码的公共 DNS，以免绕过内网/企业 DNS 或造成不必要的外部依赖。
+          # 必须在步骤 1（可能因解析 SOCKS5_SERVER 主机名而覆盖 resolv.conf）之前读取。
+          _dhcp_ns_args=""
+          while IFS= read -r _line; do
+              case "${_line}" in
+                  nameserver\ *)
+                      _ns="${_line#nameserver }"
+                      _ns="${_ns%% *}"   # 去除行尾注释/多余空格
+                      # 跳过回环（容器自身的 dnsmasq）、空值
+                      case "${_ns}" in
+                          127.*|"") continue ;;
+                      esac
+                      _dhcp_ns_args="${_dhcp_ns_args} -u ${_ns}"
+                      echo "[entrypoint] DHCP DNS: ${_ns} (将用于直连解析器)"
+                      ;;
+              esac
+          done < /etc/resolv.conf
+          # 若 DHCP 未提供任何 DNS（罕见），降级使用公共 DNS 作为保底
+          if [ -z "${_dhcp_ns_args}" ]; then
+              echo "[entrypoint] WARN: 未从 resolv.conf 获取到 DHCP DNS，直连解析器降级使用 8.8.8.8 / 1.1.1.1" >&2
+              _dhcp_ns_args="-u 8.8.8.8 -u 1.1.1.1"
+          fi
+
           # ===== 1. 确定上游 SOCKS5（宿主机上已有的代理）=====
           # SOCKS5_SERVER 留空 → 自动探测“与本容器同链路的宿主机 IP”(默认网关)
           if [ -z "${SOCKS5_SERVER}" ]; then
@@ -361,9 +386,11 @@ jobs:
 
           # ===== 10.5. 启动直连 DNS 解析器（127.0.0.1:5354，供 NO_PROXY_DOMAINS 域名查询直连使用）=====
           # 以 dnsdir(UID 1001) 运行：nftables output 链中 meta skuid 1001 return 放行，
-          # 该进程的所有出站连接不被打标（不进隧道），也不被 nat 链重定向到 dnsmasq，
-          # 从而直接以明文 DNS 与 8.8.8.8/1.1.1.1 通信，让 GeoDNS/CDN 感知到容器真实出口 IP。
-          su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 -u 8.8.8.8 -u 1.1.1.1" &
+          # 该进程的所有出站连接不被打标（不进隧道），也不被 nat 链重定向到 dnsmasq。
+          # 上游使用容器从 DHCP 获取到的 DNS（启动前从 resolv.conf 读取），
+          # 从而以本机真实网络位置查询，让 GeoDNS/CDN 感知到容器真实出口 IP。
+          # shellcheck disable=SC2086
+          su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 ${_dhcp_ns_args}" &
           _tries=0
           until (exec 3<>"/dev/tcp/127.0.0.1/5354") 2>/dev/null; do
               _tries=$((_tries + 1))
