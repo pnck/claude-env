@@ -108,9 +108,9 @@ jobs:
                   type route hook output priority mangle; policy accept;
                   # hev 到上游 SOCKS5 的连接(SO_MARK=0x438)直连放行，绝不回环
                   meta mark 0x438 return
-                  # 直连 DNS 解析器(dnsdir UID 1001)出站直连放行，不打标（NO_PROXY_DOMAINS 查询本身也直连）
-                  meta skuid 1001 return
                   # DNS 交给下面的 nat 链重定向到本地 dnsmasq（:53）
+                  # 注：本规则已按端口放行全部 :53 流量而不区分 UID，
+                  # 因此直连 DNS 解析器(dnsdir UID 1001)的查询在本链天然不会被打标，无需额外按 UID 放行
                   meta l4proto { tcp, udp } th dport 53 return
                   # 本地/私有目标直连（含宿主机网关、LAN 上的 SOCKS5）
                   ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } return
@@ -126,7 +126,8 @@ jobs:
                   type nat hook output priority dstnat; policy accept;
                   # hev 到上游 SOCKS5 的连接放行（万一上游端口恰为 53）
                   meta mark 0x438 return
-                  # 直连 DNS 解析器(dnsdir UID 1001)出站放行，不重定向（NO_PROXY_DOMAINS 查询本身也直连）
+                  # 直连 DNS 解析器(dnsdir UID 1001)出站放行，不重定向到本地 dnsmasq
+                  # （否则其发往真实 DHCP DNS 的 :53 查询会被本规则错误地打回本机）
                   meta skuid 1001 return
                   # 已指向本地 dnsmasq 的直接放行
                   ip daddr 127.0.0.1 return
@@ -164,6 +165,22 @@ jobs:
               esac
           }
 
+          # 等待本地 TCP 端口就绪（最多 10 秒），用于确认后台起的服务已开始监听
+          wait_port_ready() {
+              _wpr_port="$1"
+              _wpr_label="$2"
+              _wpr_tries=0
+              until (exec 3<>"/dev/tcp/127.0.0.1/${_wpr_port}") 2>/dev/null; do
+                  _wpr_tries=$((_wpr_tries + 1))
+                  if [ "${_wpr_tries}" -ge 20 ]; then
+                      echo "[entrypoint] WARN: ${_wpr_label} 未在 10 秒内就绪" >&2
+                      break
+                  fi
+                  sleep 0.5
+              done
+              exec 3>&- 2>/dev/null || true
+          }
+
           # ===== 0. 在任何覆盖 resolv.conf 前，提取 DHCP 分配的 DNS 服务器 =====
           # 这些 DNS 是容器/宿主机真实网络环境给的，直连解析（NO_PROXY_DOMAINS）应当使用它们，
           # 而不是硬编码的公共 DNS，以免绕过内网/企业 DNS 或造成不必要的外部依赖。
@@ -177,6 +194,12 @@ jobs:
                       # 跳过回环（容器自身的 dnsmasq）、空值
                       case "${_ns}" in
                           127.*|"") continue ;;
+                          # 本容器不支持 IPv6（已在内核层面关闭），跳过 DHCP 下发的 IPv6 DNS，
+                          # 与 NO_PROXY_IPS 对 IPv6 的处理方式保持一致
+                          *:*)
+                              echo "[entrypoint] WARN: 忽略 DHCP 下发的 IPv6 DNS '${_ns}'（本容器不支持 IPv6）" >&2
+                              continue
+                              ;;
                       esac
                       _dhcp_ns_args="${_dhcp_ns_args} -u ${_ns}"
                       echo "[entrypoint] DHCP DNS: ${_ns} (将用于直连解析器)"
@@ -372,35 +395,16 @@ jobs:
           # ===== 10. 启动 dnsproxy（仅监听 127.0.0.1:5353，供 dnsmasq 转发 DoH）=====
           dnsproxy -l 127.0.0.1 -p 5353 \
               -u https://8.8.8.8/dns-query -u https://1.1.1.1/dns-query &
-          # 等待 dnsproxy 就绪（最多 10 秒，TCP 连接验证服务已监听）
-          _tries=0
-          until (exec 3<>"/dev/tcp/127.0.0.1/5353") 2>/dev/null; do
-              _tries=$((_tries + 1))
-              if [ "${_tries}" -ge 20 ]; then
-                  echo "[entrypoint] WARN: dnsproxy 未在 10 秒内就绪" >&2
-                  break
-              fi
-              sleep 0.5
-          done
-          exec 3>&- 2>/dev/null || true
+          wait_port_ready 5353 "dnsproxy"
 
           # ===== 10.5. 启动直连 DNS 解析器（127.0.0.1:5354，供 NO_PROXY_DOMAINS 域名查询直连使用）=====
-          # 以 dnsdir(UID 1001) 运行：nftables output 链中 meta skuid 1001 return 放行，
-          # 该进程的所有出站连接不被打标（不进隧道），也不被 nat 链重定向到 dnsmasq。
+          # 以 dnsdir(UID 1001) 运行：nftables nat 链中 meta skuid 1001 return 放行，
+          # 该进程的出站 DNS 查询不被重定向到本地 dnsmasq，也天然不会在 mangle 链被打标(见 proxy.nft)。
           # 上游使用容器从 DHCP 获取到的 DNS（启动前从 resolv.conf 读取），
           # 从而以本机真实网络位置查询，让 GeoDNS/CDN 感知到容器真实出口 IP。
           # shellcheck disable=SC2086
           su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 ${_dhcp_ns_args}" &
-          _tries=0
-          until (exec 3<>"/dev/tcp/127.0.0.1/5354") 2>/dev/null; do
-              _tries=$((_tries + 1))
-              if [ "${_tries}" -ge 20 ]; then
-                  echo "[entrypoint] WARN: 直连 DNS 解析器未在 10 秒内就绪" >&2
-                  break
-              fi
-              sleep 0.5
-          done
-          exec 3>&- 2>/dev/null || true
+          wait_port_ready 5354 "直连 DNS 解析器"
 
           # ===== 11. 启动 dnsmasq（:53 前端；遥测屏蔽 + 域名直连联动 nftset）=====
           exec dnsmasq --no-daemon --conf-file=/etc/dnsmasq.conf

@@ -109,7 +109,7 @@ environment:
 - `NO_PROXY_DOMAINS`：逗号分隔域名列表。dnsmasq 把匹配域名的查询转发给**直连解析器**（`127.0.0.1:5354`，以专用 `dnsdir` UID 运行，nftables 对该 UID 出站直接放行），从容器真实出口发出 DNS 请求；同时通过 `nftset=` 把解析得到的 A 记录原子写入 `noproxy_ips` 集合，使后续 TCP/UDP 连接也走直连。这样 **DNS 查询本身** 和 **后续连接** 都从真实网络位置发出，GeoDNS/CDN 能感知到容器实际出口 IP，返回最近的边缘节点。域名天然匹配全部子域名，无需通配符。允许最多一个前导点/尾随点（如 `.example.com`、`example.com.`），会自动归一化去掉。
 - `NO_PROXY_IPS`：逗号分隔静态 IPv4/CIDR 条目。容器启动时通过 `nft add element` 直接写入 `noproxy_ips`，不依赖 DNS。
 
-> 注意：本容器不支持 IPv6（内核层面已禁用 `net.ipv6.conf.all.disable_ipv6=1` 等 sysctl），`NO_PROXY_IPS` 中的 IPv6 条目会被检测并忽略（stderr 警告）。
+> 注意：本容器不支持 IPv6（内核层面已禁用 `net.ipv6.conf.all.disable_ipv6=1` 等 sysctl），`NO_PROXY_IPS` 中的 IPv6 条目、以及直连解析器从 DHCP 读到的 IPv6 DNS 服务器，均会被检测并忽略（stderr 警告）。
 
 示例：
 
@@ -147,7 +147,7 @@ hev 自己到上游 SOCKS5 的连接带 `SO_MARK 0x438`，在 nft 里用 `meta m
 **NO_PROXY_DOMAINS 的完整直连路径**
 仅把 A 记录写入 `noproxy_ips` 是不够的——如果 DNS 查询本身也经过隧道，走 GeoDNS / EDNS Client Subnet 的 CDN 会以代理出口 IP 作为来源，返回离代理近而非离容器近的边缘节点，写入的 IP 从一开始就选错了。
 
-因此对 `NO_PROXY_DOMAINS` 中的域名，dnsmasq 把查询转发给**直连解析器**（`127.0.0.1:5354`）而非隧道化的 `dnsproxy`。直连解析器以专用 `dnsdir`（UID 1001）身份运行，nftables 对该 UID 的所有出站流量在两个链中都直接放行（mangle 链不打标、nat 链不重定向）。其上游使用容器启动时从 `/etc/resolv.conf` 读取到的 **DHCP 分配 DNS**（即宿主机/网络环境给容器的 DNS，而非硬编码的公共 DNS），从而以本机真实网络位置发出查询，让 GeoDNS/CDN 感知到容器真实出口 IP，并能利用内网/企业 DNS。若 DHCP 未提供任何 DNS，则降级使用 8.8.8.8 / 1.1.1.1 作为保底。同时，解析结果 A 记录仍通过 `nftset=` 写入 `noproxy_ips`，使后续连接也走直连。
+因此对 `NO_PROXY_DOMAINS` 中的域名，dnsmasq 把查询转发给**直连解析器**（`127.0.0.1:5354`）而非隧道化的 `dnsproxy`。直连解析器以专用 `dnsdir`（UID 1001）身份运行：其查询走 53 端口，在 mangle 链本就会被现有的“DNS 交给 nat 链处理”规则统一放行不打标（与 UID 无关）；但 nat 链会把所有 `:53` 流量重定向到本地 dnsmasq，因此需要单独一条 `meta skuid 1001 return` 放行该 UID，避免其查询被错误地打回本机。其上游使用容器启动时从 `/etc/resolv.conf` 读取到的 **DHCP 分配 DNS**（即宿主机/网络环境给容器的 DNS，而非硬编码的公共 DNS，且会跳过其中的 IPv6 地址），从而以本机真实网络位置发出查询，让 GeoDNS/CDN 感知到容器真实出口 IP，并能利用内网/企业 DNS。若 DHCP 未提供任何可用 DNS，则降级使用 8.8.8.8 / 1.1.1.1 作为保底。同时，解析结果 A 记录仍通过 `nftset=` 写入 `noproxy_ips`，使后续连接也走直连。
 
 `NO_PROXY_IPS` 则是在启动阶段通过 `nft add element` 静态写入同一个 `noproxy_ips` 集合，不经过 DNS 解析流程。
 
