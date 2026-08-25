@@ -181,6 +181,26 @@ jobs:
               exec 3>&- 2>/dev/null || true
           }
 
+          # 校验是否为合法 IPv4 dotted-quad（四段 0-255 十进制数）
+          is_valid_ipv4() {
+              case "$1" in
+                  *[!0-9.]*) return 1 ;;
+              esac
+              _iv4_old_ifs="${IFS}"
+              IFS=.
+              # shellcheck disable=SC2086  # 借助 IFS=. 做字段拆分，需要不加引号
+              set -- $1
+              IFS="${_iv4_old_ifs}"
+              [ "$#" -eq 4 ] || return 1
+              for _iv4_octet in "$@"; do
+                  case "${_iv4_octet}" in
+                      ""|*[!0-9]*) return 1 ;;
+                  esac
+                  [ "${_iv4_octet}" -le 255 ] || return 1
+              done
+              return 0
+          }
+
           # ===== 0. 在任何覆盖 resolv.conf 前，提取 DHCP 分配的 DNS 服务器 =====
           # 这些 DNS 是容器/宿主机真实网络环境给的，直连解析（NO_PROXY_DOMAINS）应当使用它们，
           # 而不是硬编码的公共 DNS，以免绕过内网/企业 DNS 或造成不必要的外部依赖。
@@ -201,7 +221,14 @@ jobs:
                               continue
                               ;;
                       esac
-                      _dhcp_ns_args="${_dhcp_ns_args} -u ${_ns}"
+                      # 校验为合法 IPv4 dotted-quad 后才使用：随后会被拼进 su -c 的命令
+                      # 字符串，严格校验可防止 resolv.conf 中意外/恶意内容注入 shell 命令，
+                      # 也避免把畸形地址传给 dnsproxy
+                      if ! is_valid_ipv4 "${_ns}"; then
+                          echo "[entrypoint] WARN: 忽略格式非法的 DHCP DNS '${_ns}'" >&2
+                          continue
+                      fi
+                      _dhcp_ns_args="${_dhcp_ns_args:+${_dhcp_ns_args} }-u ${_ns}"
                       echo "[entrypoint] DHCP DNS: ${_ns} (将用于直连解析器)"
                       ;;
               esac
