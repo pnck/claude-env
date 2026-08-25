@@ -57,6 +57,8 @@ jobs:
           FROM debian:trixie-slim
           #   procps 提供 sysctl；nftables/iproute2 做规则与策略路由；curl 供 healthcheck
           RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 ca-certificates curl procps dnsmasq && rm -rf /var/lib/apt/lists/*
+          # dnsdir：专用于直连 DNS 解析器（NO_PROXY_DOMAINS 路径），nftables 通过 UID 1001 放行其出站流量
+          RUN useradd -r -u 1001 -s /usr/sbin/nologin dnsdir
 
           COPY --from=builder /src/bin/hev-socks5-tproxy /usr/local/bin/
           COPY --from=builder /usr/local/bin/dnsproxy /usr/local/bin/
@@ -106,6 +108,8 @@ jobs:
                   type route hook output priority mangle; policy accept;
                   # hev 到上游 SOCKS5 的连接(SO_MARK=0x438)直连放行，绝不回环
                   meta mark 0x438 return
+                  # 直连 DNS 解析器(dnsdir UID 1001)出站直连放行，不打标（NO_PROXY_DOMAINS 查询本身也直连）
+                  meta skuid 1001 return
                   # DNS 交给下面的 nat 链重定向到本地 dnsmasq（:53）
                   meta l4proto { tcp, udp } th dport 53 return
                   # 本地/私有目标直连（含宿主机网关、LAN 上的 SOCKS5）
@@ -122,6 +126,8 @@ jobs:
                   type nat hook output priority dstnat; policy accept;
                   # hev 到上游 SOCKS5 的连接放行（万一上游端口恰为 53）
                   meta mark 0x438 return
+                  # 直连 DNS 解析器(dnsdir UID 1001)出站放行，不重定向（NO_PROXY_DOMAINS 查询本身也直连）
+                  meta skuid 1001 return
                   # 已指向本地 dnsmasq 的直接放行
                   ip daddr 127.0.0.1 return
                   # 其它一切 :53 统一重定向到本机 dnsmasq(127.0.0.1:53)
@@ -307,7 +313,8 @@ jobs:
 
           # ===== 9. 生成 dnsmasq.conf =====
           #   - addn-hosts: 复用遥测域名 hosts 文件（0.0.0.0 拦截）
-          #   - nftset: NO_PROXY_DOMAINS 域名的 A 记录同步写入 nft set，实现动态直连
+          #   - server/nftset: NO_PROXY_DOMAINS 域名的查询转发给直连解析器(127.0.0.1:5354)，
+          #     并把 A 记录同步写入 nft set，实现动态直连（DNS 查询本身和连接均走直连）
           #   - server: 其余查询转发给本地 dnsproxy(127.0.0.1:5353) 做 DoH
           {
               echo "no-resolv"
@@ -322,6 +329,9 @@ jobs:
                   for _d in ${NO_PROXY_DOMAINS}; do
                       [ -z "${_d}" ] && continue
                       if _d_norm="$(normalize_domain "${_d}")"; then
+                          # 直连域名查询走独立直连解析器(127.0.0.1:5354，以 dnsdir UID 运行，nft 放行)
+                          # 这样 DNS 查询本身也从本机真实网络位置发出，GeoDNS/CDN 能选出正确的边缘节点
+                          echo "server=/${_d_norm}/127.0.0.1#5354"
                           # 仅写 IPv4(#4#) 的 nftset：本容器不支持 IPv6，AAAA 记录不做处理
                           echo "nftset=/${_d_norm}/4#ip#tproxy_mangle#noproxy_ips"
                           echo "[entrypoint] NO_PROXY_DOMAINS: 直连域名 ${_d_norm}" >&2
@@ -343,6 +353,22 @@ jobs:
               _tries=$((_tries + 1))
               if [ "${_tries}" -ge 20 ]; then
                   echo "[entrypoint] WARN: dnsproxy 未在 10 秒内就绪" >&2
+                  break
+              fi
+              sleep 0.5
+          done
+          exec 3>&- 2>/dev/null || true
+
+          # ===== 10.5. 启动直连 DNS 解析器（127.0.0.1:5354，供 NO_PROXY_DOMAINS 域名查询直连使用）=====
+          # 以 dnsdir(UID 1001) 运行：nftables output 链中 meta skuid 1001 return 放行，
+          # 该进程的所有出站连接不被打标（不进隧道），也不被 nat 链重定向到 dnsmasq，
+          # 从而直接以明文 DNS 与 8.8.8.8/1.1.1.1 通信，让 GeoDNS/CDN 感知到容器真实出口 IP。
+          su -s /bin/sh dnsdir -c "exec dnsproxy -l 127.0.0.1 -p 5354 -u 8.8.8.8 -u 1.1.1.1" &
+          _tries=0
+          until (exec 3<>"/dev/tcp/127.0.0.1/5354") 2>/dev/null; do
+              _tries=$((_tries + 1))
+              if [ "${_tries}" -ge 20 ]; then
+                  echo "[entrypoint] WARN: 直连 DNS 解析器未在 10 秒内就绪" >&2
                   break
               fi
               sleep 0.5
